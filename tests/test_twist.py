@@ -1,9 +1,10 @@
-"""Tests for TwistHead and TwistTrainingBuffer."""
+"""Tests for TwistHead, TwistTrainingBuffer, and collect_twist_training_data."""
 
 import torch
 import numpy as np
 import pytest
-from block_smc.twist import TwistHead, TwistTrainingBuffer, train_twist_step
+from unittest.mock import AsyncMock, MagicMock
+from block_smc.twist import TwistHead, TwistTrainingBuffer, train_twist_step, collect_twist_training_data
 
 
 class TestTwistHead:
@@ -125,3 +126,111 @@ class TestTrainTwistStep:
         buf = TwistTrainingBuffer()
         result = train_twist_step(head, buf, optimizer, torch.device("cpu"))
         assert np.isnan(result["loss"])
+
+
+class TestCollectTwistTrainingData:
+    """Tests for collect_twist_training_data using mock objects."""
+
+    def _make_mock_sequences(self, n_particles=3, n_units=2):
+        """Create mock Sequences with nested unit contexts."""
+        from genlm.control.constant import EndOfSequence
+
+        contexts = []
+        for i in range(n_particles):
+            # Each context: [[unit1_tokens], [unit2_tokens], EndOfSequence]
+            units = [[b"tok%d_%d" % (i, k)] for k in range(n_units)]
+            units.append(EndOfSequence())
+            contexts.append(units)
+
+        log_weights = np.array([0.0] * n_particles)  # uniform weights
+        norm_weights = np.exp(log_weights - np.log(np.sum(np.exp(log_weights))))
+
+        seq = MagicMock()
+        seq.contexts = contexts
+        seq.normalized_weights = norm_weights
+        return seq
+
+    def _make_mock_hse(self, d_model=32):
+        """Create mock HiddenStateExtractor."""
+        hse = MagicMock()
+        hse.token_ids_from_bytes = MagicMock(return_value=[1, 2, 3])
+        hse.extract = MagicMock(return_value=torch.randn(d_model))
+        return hse
+
+    def _make_mock_potential(self, complete_score=0.0, prefix_score=0.0):
+        """Create mock expensive potential."""
+        pot = AsyncMock()
+        pot.complete = AsyncMock(return_value=complete_score)
+        pot.prefix = AsyncMock(return_value=prefix_score)
+        return pot
+
+    @pytest.mark.asyncio
+    async def test_basic_collection(self):
+        """Collects examples from all particles at all boundaries."""
+        seq = self._make_mock_sequences(n_particles=3, n_units=2)
+        hse = self._make_mock_hse(d_model=32)
+        pot = self._make_mock_potential(complete_score=0.0)
+        buffer = TwistTrainingBuffer()
+
+        stats = await collect_twist_training_data(seq, hse, pot, buffer)
+
+        # 3 particles × 2 boundaries = 6 examples
+        assert stats["n_examples"] == 6
+        assert stats["n_particles"] == 3
+        assert stats["n_positive"] == 3  # complete_score=0.0 > -inf → label=1
+        assert len(buffer) == 6
+
+    @pytest.mark.asyncio
+    async def test_negative_labels(self):
+        """Particles failing constraint get label=0."""
+        seq = self._make_mock_sequences(n_particles=2, n_units=2)
+        hse = self._make_mock_hse()
+        pot = self._make_mock_potential(complete_score=float("-inf"))
+        buffer = TwistTrainingBuffer()
+
+        stats = await collect_twist_training_data(seq, hse, pot, buffer)
+
+        assert stats["n_positive"] == 0
+        assert all(label == 0.0 for label in buffer.labels)
+
+    @pytest.mark.asyncio
+    async def test_skips_zero_weight_particles(self):
+        """Particles with zero weight are skipped."""
+        seq = self._make_mock_sequences(n_particles=3, n_units=2)
+        seq.normalized_weights = np.array([0.5, 0.0, 0.5])
+        hse = self._make_mock_hse()
+        pot = self._make_mock_potential(complete_score=0.0)
+        buffer = TwistTrainingBuffer()
+
+        stats = await collect_twist_training_data(seq, hse, pot, buffer)
+
+        # Only 2 particles contribute (indices 0 and 2), 2 boundaries each
+        assert stats["n_examples"] == 4
+
+    @pytest.mark.asyncio
+    async def test_boundary_fracs(self):
+        """Boundary fractions are correctly computed as (k+1)/K."""
+        seq = self._make_mock_sequences(n_particles=1, n_units=4)
+        hse = self._make_mock_hse()
+        pot = self._make_mock_potential(complete_score=0.0)
+        buffer = TwistTrainingBuffer()
+
+        await collect_twist_training_data(seq, hse, pot, buffer)
+
+        # 4 boundaries: fracs should be 0.25, 0.5, 0.75, 1.0
+        expected = [0.25, 0.5, 0.75, 1.0]
+        for actual, exp in zip(buffer.boundary_fracs, expected):
+            assert abs(actual - exp) < 1e-6
+
+    @pytest.mark.asyncio
+    async def test_empty_sequences(self):
+        """Handles empty contexts gracefully."""
+        seq = MagicMock()
+        seq.contexts = [[], []]
+        seq.normalized_weights = np.array([0.5, 0.5])
+        hse = self._make_mock_hse()
+        pot = self._make_mock_potential()
+        buffer = TwistTrainingBuffer()
+
+        stats = await collect_twist_training_data(seq, hse, pot, buffer)
+        assert stats["n_examples"] == 0

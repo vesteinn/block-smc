@@ -137,9 +137,8 @@ class TwistTrainingBuffer:
             (hidden_states, weights, labels, boundary_fracs) as tensors.
         """
         if not self.hidden_states:
-            d = self.hidden_states[0].shape[-1] if self.hidden_states else 1
             return (
-                torch.empty(0, d, device=device),
+                torch.empty(0, 1, device=device),
                 torch.empty(0, device=device),
                 torch.empty(0, device=device),
                 torch.empty(0, device=device),
@@ -169,6 +168,98 @@ class TwistTrainingBuffer:
 
     def __len__(self) -> int:
         return len(self.hidden_states)
+
+
+async def collect_twist_training_data(
+    sequences,
+    hidden_state_extractor,
+    expensive_potential,
+    buffer: TwistTrainingBuffer,
+):
+    """Collect twist training data from completed Block SMC results.
+
+    For each particle, at each block boundary:
+        - Extract h from the LM at the boundary position
+        - Record (h, normalised_weight, label, k/K)
+
+    The label y=1 if the complete sequence satisfies Φ (expensive potential
+    returns finite score), y=0 otherwise.
+
+    Args:
+        sequences: Sequences object from Block SMC run (contexts are nested units).
+        hidden_state_extractor: HiddenStateExtractor for the LM.
+        expensive_potential: Coerced Φ_exp potential (operates on flat LLM tokens).
+        buffer: TwistTrainingBuffer to populate.
+
+    Returns:
+        Dict with collection stats: n_examples, n_positive, n_particles.
+    """
+    from block_smc.critic import _flatten_context
+    from genlm.control.constant import EndOfSequence
+
+    contexts = sequences.contexts
+    norm_weights = sequences.normalized_weights
+    n_particles = len(contexts)
+    n_examples = 0
+    n_positive = 0
+
+    for i in range(n_particles):
+        ctx = contexts[i]
+        w_i = float(norm_weights[i])
+
+        if w_i == 0.0 or np.isnan(w_i):
+            continue
+
+        # Separate units from EOS
+        units = [u for u in ctx if isinstance(u, list)]
+        if not units:
+            continue
+
+        # Evaluate full sequence: does it satisfy Φ?
+        flat_all = _flatten_context(ctx)
+        has_eos = any(isinstance(t, EndOfSequence) for t in flat_all)
+        byte_tokens = [t for t in flat_all if isinstance(t, bytes)]
+
+        if has_eos and byte_tokens:
+            # Complete sequence → evaluate with complete()
+            complete_score = await expensive_potential.complete(byte_tokens)
+            label = 1.0 if complete_score > float("-inf") else 0.0
+        else:
+            # Incomplete → evaluate prefix
+            prefix_score = await expensive_potential.prefix(byte_tokens)
+            label = 1.0 if prefix_score > float("-inf") else 0.0
+
+        n_positive += int(label)
+        K = len(units)
+
+        # Extract hidden state at each block boundary
+        cumulative_tokens = []
+        for k, unit in enumerate(units):
+            cumulative_tokens.extend(unit)
+            byte_toks = [t for t in cumulative_tokens if isinstance(t, bytes)]
+            if not byte_toks:
+                continue
+
+            token_ids = hidden_state_extractor.token_ids_from_bytes(byte_toks)
+            if not token_ids:
+                continue
+
+            h = hidden_state_extractor.extract(token_ids, position=-1)
+            boundary_frac = (k + 1) / K
+
+            buffer.add(
+                hidden_state=h,
+                weight=w_i,
+                label=label,
+                boundary_frac=boundary_frac,
+            )
+            n_examples += 1
+
+    return {
+        "n_examples": n_examples,
+        "n_positive": n_positive,
+        "n_particles": n_particles,
+    }
 
 
 def train_twist_step(

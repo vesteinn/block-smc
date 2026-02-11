@@ -65,8 +65,9 @@ class HiddenStateExtractor:
         input_ids = torch.tensor([token_ids], device=self.device)
         with torch.no_grad():
             outputs = self.hf_model(input_ids, output_hidden_states=True)
-        # Last layer hidden state at the specified position
-        return outputs.hidden_states[-1][0, position, :].detach()
+        # Last layer hidden state at the specified position, cast to float32
+        # (LM may use bfloat16 but twist head trains in float32)
+        return outputs.hidden_states[-1][0, position, :].detach().float()
 
     def extract_batch(
         self, token_ids_list: list[list[int]], position: int = -1
@@ -106,7 +107,7 @@ class HiddenStateExtractor:
                 output_hidden_states=True,
             )
 
-        return outputs.hidden_states[-1][:, position, :].detach()
+        return outputs.hidden_states[-1][:, position, :].detach().float()
 
     def token_ids_from_bytes(self, byte_tokens: list[bytes]) -> list[int]:
         """Convert byte tokens (from genlm-control) to token IDs.

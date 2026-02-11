@@ -1,6 +1,6 @@
 """Block SMC with learned twist functions and EM boundary learning."""
 
-from block_smc.twist import TwistHead, TwistTrainingBuffer, train_twist_step
+from block_smc.twist import TwistHead, TwistTrainingBuffer, train_twist_step, collect_twist_training_data
 from block_smc.critic import TwistedBlockCritic, OracleTwistCritic
 from block_smc.boundary import (
     PositionListBoundary,
@@ -15,6 +15,7 @@ __all__ = [
     "TwistHead",
     "TwistTrainingBuffer",
     "train_twist_step",
+    "collect_twist_training_data",
     "TwistedBlockCritic",
     "OracleTwistCritic",
     "PositionListBoundary",

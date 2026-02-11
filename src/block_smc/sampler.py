@@ -34,6 +34,7 @@ def make_block_smc(
     num_blocks: Optional[int] = None,
     max_subunits_per_unit: int = 100,
     oracle_twist: bool = False,
+    twist_scale: float = 1.0,
 ) -> SMC:
     """Create a Block SMC sampler with optional learned twist.
 
@@ -54,6 +55,8 @@ def make_block_smc(
         max_subunits_per_unit: Max tokens per block before timeout.
         oracle_twist: If True, use the expensive potential as the twist (for validation).
             Overrides twist_head.
+        twist_scale: Scaling factor α for log(ψ). Default 1.0 (no scaling).
+            Values < 1 temper the twist's influence on resampling weights.
 
     Returns:
         SMC instance ready to call with (n_particles, ess_threshold, max_tokens).
@@ -81,6 +84,7 @@ def make_block_smc(
             twist_head=twist_head,
             hidden_state_extractor=hidden_state_extractor,
             num_blocks=num_blocks,
+            twist_scale=twist_scale,
         )
 
     return SMC(unit_sampler=unit_sampler, critic=critic)

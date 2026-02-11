@@ -176,6 +176,7 @@ async def collect_twist_training_data(
     expensive_potential,
     buffer: TwistTrainingBuffer,
     boundary_level_labels: bool = True,
+    num_blocks_est: int = None,
 ):
     """Collect twist training data from completed Block SMC results.
 
@@ -197,6 +198,10 @@ async def collect_twist_training_data(
         buffer: TwistTrainingBuffer to populate.
         boundary_level_labels: If True, evaluate prefix at each boundary for
             per-boundary labels. If False, use global sequence label.
+        num_blocks_est: Estimated total number of blocks (max_tokens // block_size).
+            If provided, boundary fractions are computed as (k+1)/num_blocks_est,
+            matching the inference computation in TwistedBlockCritic._compute_twist().
+            If None, uses the actual number of blocks per particle (legacy behavior).
 
     Returns:
         Dict with collection stats: n_examples, n_positive, n_particles.
@@ -237,7 +242,9 @@ async def collect_twist_training_data(
                 prefix_score = await expensive_potential.prefix(all_byte_tokens)
                 global_label = 1.0 if prefix_score > float("-inf") else 0.0
 
-        K = len(units)
+        K_actual = len(units)
+        # Use estimated total blocks (matching inference) or actual (legacy)
+        K = num_blocks_est if num_blocks_est is not None else K_actual
 
         # Extract hidden state at each block boundary
         cumulative_tokens = []
@@ -253,7 +260,7 @@ async def collect_twist_training_data(
 
             # Compute label for this boundary
             if boundary_level_labels:
-                is_final = (k == K - 1)
+                is_final = (k == K_actual - 1)
                 if is_final and has_eos:
                     # Final boundary with EOS: use complete()
                     score = await expensive_potential.complete(byte_toks)
@@ -292,13 +299,14 @@ def train_twist_step(
     batch_size: int = 256,
     discount: float = 0.9,
     class_balance: bool = True,
+    uniform_weights: bool = True,
 ) -> dict:
-    """Train the twist head on buffered data via weighted BCE.
+    """Train the twist head on buffered data via BCE.
 
-    Loss: L = Σ_i w_i · bce_i / Σ_i w_i
-
-    With class_balance=True, positive-class BCE terms are scaled by n_neg/n_pos
-    to compensate for class imbalance in the training buffer.
+    By default uses uniform sample weights (ignoring SMC importance weights)
+    with class balancing. This prevents the training collapse where ψ→1 for
+    everything, which occurs when importance weights correlate with labels
+    and break the class balance correction.
 
     Args:
         twist_head: The TwistHead module.
@@ -307,8 +315,12 @@ def train_twist_step(
         device: Compute device.
         n_epochs: Number of passes over the buffer.
         batch_size: Mini-batch size.
-        discount: Age discount factor.
-        class_balance: If True, apply pos_weight = n_neg / n_pos to balance classes.
+        discount: Age discount factor (only used when uniform_weights=False).
+        class_balance: If True, apply pos_weight to balance classes.
+        uniform_weights: If True (default), ignore SMC importance weights and
+            treat all examples equally. Recommended because labels come from
+            ground-truth constraint evaluation, making importance weighting
+            unnecessary and harmful (causes gradient imbalance).
 
     Returns:
         Dict with 'loss' (final epoch average) and 'accuracy' (on training set).
@@ -319,13 +331,22 @@ def train_twist_step(
     h, w, y, bf = buffer.to_tensors(device, discount=discount)
     n = h.shape[0]
 
+    if uniform_weights:
+        w = torch.ones(n, device=device)
+
     # Compute class balance weight
     n_pos = (y > 0.5).sum().item()
     n_neg = (y <= 0.5).sum().item()
     if class_balance and n_pos > 0 and n_neg > 0:
-        pos_weight = n_neg / n_pos
+        # Balance by weight sums (not just counts) to handle correlated weights
+        w_pos_sum = w[y > 0.5].sum().item()
+        w_neg_sum = w[y <= 0.5].sum().item()
+        pos_weight = w_neg_sum / max(w_pos_sum, 1e-8)
     else:
         pos_weight = 1.0
+
+    # pos_weight tensor for binary_cross_entropy_with_logits
+    pw_tensor = torch.tensor([pos_weight], device=device)
 
     twist_head.train()
     total_loss = 0.0
@@ -340,15 +361,17 @@ def train_twist_step(
             y_batch = y[idx]
             bf_batch = bf[idx]
 
-            psi = twist_head(h_batch, bf_batch)
-            # Weighted BCE with class balancing
-            eps = 1e-7
-            bce_pos = -y_batch * torch.log(psi + eps)
-            bce_neg = -(1 - y_batch) * torch.log(1 - psi + eps)
-            bce = pos_weight * bce_pos + bce_neg
+            # Get raw logits (before sigmoid) for numerically stable BCE
+            if bf_batch.dim() < h_batch.dim():
+                bf_batch = bf_batch.unsqueeze(-1)
+            x = torch.cat([h_batch, bf_batch], dim=-1)
+            logits = twist_head.net(x).squeeze(-1)
 
-            # Proper normalization: weighted sum / weight sum
-            loss = (w_batch * bce).sum() / (w_batch.sum() + 1e-8)
+            # Numerically stable BCE with class balancing via pos_weight
+            per_sample_loss = nn.functional.binary_cross_entropy_with_logits(
+                logits, y_batch, pos_weight=pw_tensor, reduction='none'
+            )
+            loss = (w_batch * per_sample_loss).sum() / (w_batch.sum() + 1e-8)
 
             optimizer.zero_grad()
             loss.backward()
@@ -415,10 +438,16 @@ def adapt_twist_online(
     h, w, y, bf = buffer.to_tensors(device, discount=discount)
     n = h.shape[0]
 
-    # Class balancing
+    # Use uniform weights for online adaptation too
+    w = torch.ones(n, device=device)
+
+    # Class balancing by weight sums
     n_pos = (y > 0.5).sum().item()
     n_neg = (y <= 0.5).sum().item()
-    pos_weight = n_neg / n_pos if n_pos > 0 and n_neg > 0 else 1.0
+    w_pos_sum = w[y > 0.5].sum().item() if n_pos > 0 else 0
+    w_neg_sum = w[y <= 0.5].sum().item() if n_neg > 0 else 0
+    pos_weight = w_neg_sum / max(w_pos_sum, 1e-8) if n_pos > 0 and n_neg > 0 else 1.0
+    pw_tensor = torch.tensor([pos_weight], device=device)
 
     total_loss = 0.0
     n_batches = 0
@@ -428,12 +457,15 @@ def adapt_twist_online(
             idx = perm[start : start + batch_size]
             h_batch, w_batch, y_batch, bf_batch = h[idx], w[idx], y[idx], bf[idx]
 
-            psi = twist_head(h_batch, bf_batch)
-            eps = 1e-7
-            bce_pos = -y_batch * torch.log(psi + eps)
-            bce_neg = -(1 - y_batch) * torch.log(1 - psi + eps)
-            bce = pos_weight * bce_pos + bce_neg
-            bce_loss = (w_batch * bce).sum() / (w_batch.sum() + 1e-8)
+            # Numerically stable BCE
+            if bf_batch.dim() < h_batch.dim():
+                bf_batch = bf_batch.unsqueeze(-1)
+            x = torch.cat([h_batch, bf_batch], dim=-1)
+            logits = twist_head.net(x).squeeze(-1)
+            per_sample_loss = nn.functional.binary_cross_entropy_with_logits(
+                logits, y_batch, pos_weight=pw_tensor, reduction='none'
+            )
+            bce_loss = (w_batch * per_sample_loss).sum() / (w_batch.sum() + 1e-8)
 
             # L2 penalty: ||θ - θ_pretrained||²
             l2_loss = sum(

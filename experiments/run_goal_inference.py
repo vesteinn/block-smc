@@ -207,7 +207,7 @@ def format_metric(m):
 async def run_single_instance(
     method_name, instance, llm, grammar, domain_text, evaluator,
     n_particles, max_tokens, ess_threshold, block_size,
-    twist_head=None, hse=None, seed=42,
+    twist_head=None, hse=None, seed=42, twist_scale=1.0,
 ):
     """Run a single method on a single instance."""
     np.random.seed(seed)
@@ -253,8 +253,9 @@ async def run_single_instance(
         )
         seq = await run_block_smc(smc, n_particles=n_particles, ess_threshold=ess_threshold, max_tokens=max_tokens)
         posterior = decode_block_sequences(seq)
-    elif method_name == "block_twist":
-        # Block SMC, learned twist
+    elif method_name.startswith("block_twist"):
+        # Block SMC, learned twist (with optional twist_scale and online adaptation)
+        is_online = method_name == "block_twist_online"
         num_blocks_est = max(max_tokens // block_size, 1)
         smc = make_block_smc(
             token_sampler=token_sampler,
@@ -262,37 +263,34 @@ async def run_single_instance(
             expensive_potential=expensive, llm=local_llm,
             twist_head=twist_head, hidden_state_extractor=hse,
             num_blocks=num_blocks_est,
+            twist_scale=twist_scale,
         )
-        seq = await run_block_smc(smc, n_particles=n_particles, ess_threshold=ess_threshold, max_tokens=max_tokens)
-        posterior = decode_block_sequences(seq)
-    elif method_name == "block_twist_online":
-        # Block SMC, learned twist + per-instance online adaptation
-        num_blocks_est = max(max_tokens // block_size, 1)
-        smc = make_block_smc(
-            token_sampler=token_sampler,
-            boundary_predicate=FixedIntervalBoundary(block_size),
-            expensive_potential=expensive, llm=local_llm,
-            twist_head=twist_head, hidden_state_extractor=hse,
-            num_blocks=num_blocks_est,
-        )
-        # Save pretrained weights
-        pretrained_state = {k: v.clone() for k, v in twist_head.state_dict().items()}
+        if not is_online:
+            seq = await run_block_smc(smc, n_particles=n_particles, ess_threshold=ess_threshold, max_tokens=max_tokens)
+            posterior = decode_block_sequences(seq)
+        else:
+            # Save pretrained weights
+            pretrained_state = {k: v.clone() for k, v in twist_head.state_dict().items()}
 
-        # Phase 1: run SMC with pretrained twist
-        seq_phase1 = await run_block_smc(smc, n_particles=n_particles, ess_threshold=ess_threshold, max_tokens=max_tokens)
+            # Phase 1: run SMC with pretrained twist
+            seq_phase1 = await run_block_smc(smc, n_particles=n_particles, ess_threshold=ess_threshold, max_tokens=max_tokens)
 
-        # Adapt twist to this instance
-        adapt_buffer = TwistTrainingBuffer()
-        await collect_twist_training_data(seq_phase1, hse, coerced, adapt_buffer)
-        device = next(twist_head.parameters()).device
-        adapt_result = adapt_twist_online(twist_head, adapt_buffer, device)
+            # Adapt twist to this instance
+            adapt_buffer = TwistTrainingBuffer()
+            await collect_twist_training_data(seq_phase1, hse, coerced, adapt_buffer, num_blocks_est=num_blocks_est)
+            device = next(twist_head.parameters()).device
+            adapt_result = adapt_twist_online(twist_head, adapt_buffer, device)
 
-        # Phase 2: run SMC with adapted twist
-        seq = await run_block_smc(smc, n_particles=n_particles, ess_threshold=ess_threshold, max_tokens=max_tokens)
-        posterior = decode_block_sequences(seq)
+            # Phase 2: run SMC with adapted twist (reset RNG so Phase 2 explores
+            # the same trajectory space that Phase 1 did — the twist was trained on
+            # Phase 1's particles, so Phase 2 must see the same randomness)
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+            seq = await run_block_smc(smc, n_particles=n_particles, ess_threshold=ess_threshold, max_tokens=max_tokens)
+            posterior = decode_block_sequences(seq)
 
-        # Restore pretrained weights for next instance
-        restore_twist_weights(twist_head, pretrained_state)
+            # Restore pretrained weights for next instance
+            restore_twist_weights(twist_head, pretrained_state)
     else:
         raise ValueError(f"Unknown method: {method_name}")
 
@@ -326,6 +324,7 @@ async def train_twist_for_domain(
     buffer = TwistTrainingBuffer()
     n_guided = n_train_rounds // 2
     n_explore = n_train_rounds - n_guided
+    num_blocks_est = max(max_tokens // block_size, 1)
 
     for inst_idx, instance in enumerate(instances):
         use_chat = "instruct" in llm.model.name.lower() if hasattr(llm.model, 'name') else False
@@ -354,7 +353,7 @@ async def train_twist_for_domain(
                 expensive_potential=expensive, llm=local_llm, oracle_twist=False,
             )
             seq = await run_block_smc(smc_collect, n_particles=n_particles, ess_threshold=0.9, max_tokens=max_tokens)
-            stats = await collect_twist_training_data(seq, hse, coerced, buffer)
+            stats = await collect_twist_training_data(seq, hse, coerced, buffer, num_blocks_est=num_blocks_est)
             print(f"  Inst {inst_idx} Guided {r+1}: ex={stats['n_examples']} pos={stats['n_positive']}")
             buffer.advance_age()
 
@@ -366,7 +365,7 @@ async def train_twist_for_domain(
             )
             explore_smc = SMC(unit_sampler)
             seq = await explore_smc(n_particles=n_particles, ess_threshold=0.5, max_tokens=max_tokens)
-            stats = await collect_twist_training_data(seq, hse, coerced, buffer)
+            stats = await collect_twist_training_data(seq, hse, coerced, buffer, num_blocks_est=num_blocks_est)
             print(f"  Inst {inst_idx} Explore {r+1}: ex={stats['n_examples']} pos={stats['n_positive']} neg={stats['n_examples'] - stats['n_positive']}")
             buffer.advance_age()
 
@@ -374,12 +373,17 @@ async def train_twist_for_domain(
     n_neg = sum(1 for l in buffer.labels if l <= 0.5)
     print(f"\n  Buffer: {len(buffer)} examples, {n_pos}+, {n_neg}-")
 
-    # Train
+    # Override boundary fracs (bf=False was best in sweep)
+    buffer.boundary_fracs = [0.0] * len(buffer)
+
+    # Train with uniform weights + class balance (fixes ψ=1.0 collapse)
     d_model = hse.hidden_dim
     device = hse.device
     twist_head = TwistHead(d_model=d_model, hidden_dim=256).to(device)
-    optimizer = torch.optim.Adam(twist_head.parameters(), lr=1e-3)
-    train_result = train_twist_step(twist_head, buffer, optimizer, device, n_epochs=20, batch_size=64)
+    optimizer = torch.optim.Adam(twist_head.parameters(), lr=5e-3)
+    train_result = train_twist_step(twist_head, buffer, optimizer, device,
+                                     n_epochs=50, batch_size=64,
+                                     class_balance=True, uniform_weights=True)
     print(f"  Twist: loss={train_result['loss']:.4f} acc={train_result['accuracy']:.4f}")
 
     twist_head.eval()
@@ -441,38 +445,52 @@ async def main(args):
     # =========================================================================
     # PHASE 2: EVALUATE (on held-out instances only)
     # =========================================================================
-    methods = ["baseline", "block_vanilla", "block_twist", "block_twist_online"]
+    # Build method list: baseline + vanilla + twist at each scale + online at default scale
+    twist_scales = [float(s) for s in args.twist_scales.split(",")]
+    methods = ["baseline", "block_vanilla"]
+    method_twist_scale = {}  # method_name -> twist_scale
+    for ts in twist_scales:
+        name = f"block_twist_s{ts:.1f}" if ts != 1.0 else "block_twist"
+        methods.append(name)
+        method_twist_scale[name] = ts
+    methods.append("block_twist_online")
+    method_twist_scale["block_twist_online"] = twist_scales[0]  # use best (first) scale for online
+
     all_results = {m: [] for m in methods}
 
     print(f"\n{'='*70}")
     print(f"PHASE 2: EVALUATION ({len(eval_instances)} held-out instances, N={N}, T={T}, BS={BS})")
+    print(f"twist_scales: {twist_scales}")
     print(f"{'='*70}")
 
     for inst_idx, instance in enumerate(eval_instances):
         print(f"\n--- Eval {inst_idx} (id={instance.instance_id}): {instance.nl_goal[:80]}... ---")
 
         for method in methods:
+            needs_twist = method.startswith("block_twist")
+            ts = method_twist_scale.get(method, 1.0)
             try:
                 result = await run_single_instance(
-                    method_name=method,
+                    method_name="block_twist_online" if method == "block_twist_online" else ("block_twist" if needs_twist else method),
                     instance=instance,
                     llm=llm, grammar=grammar, domain_text=domain_text,
                     evaluator=evaluator,
                     n_particles=N, max_tokens=T, ess_threshold=0.9,
                     block_size=BS,
-                    twist_head=twist_head if method in ("block_twist", "block_twist_online") else None,
-                    hse=hse if method in ("block_twist", "block_twist_online") else None,
+                    twist_head=twist_head if needs_twist else None,
+                    hse=hse if needs_twist else None,
                     seed=42 + inst_idx,
+                    twist_scale=ts,
                 )
                 all_results[method].append(result)
-                print(f"  {method:<20} acc={result['accuracy']:.0f}  "
+                print(f"  {method:<25} acc={result['accuracy']:.0f}  "
                       f"log_Z={result['log_ml']:.2f}  "
                       f"ess={result['ess']:.1f}  "
                       f"time={result['wall_time']:.1f}s  "
                       f"uniq={result['n_unique']}  "
                       f"best='{result['best_response'][:50]}'")
             except Exception as e:
-                print(f"  {method:<20} FAILED: {e}")
+                print(f"  {method:<25} FAILED: {e}")
                 all_results[method].append({
                     "log_ml": float("-inf"), "ess": 0.0,
                     "wall_time": 0.0, "accuracy": 0.0,
@@ -491,9 +509,12 @@ async def main(args):
     method_labels = {
         "baseline": "Baseline (token-level)",
         "block_vanilla": f"Block (vanilla, BS={BS})",
-        "block_twist": f"Block (twist, BS={BS})",
         "block_twist_online": f"Block (online, BS={BS})",
     }
+    for m in methods:
+        if m not in method_labels:
+            ts = method_twist_scale.get(m, 1.0)
+            method_labels[m] = f"Block (twist α={ts:.1f})"
 
     # Compute metrics
     metrics_by_method = {}
@@ -553,6 +574,8 @@ if __name__ == "__main__":
     parser.add_argument("--max-objects", type=int, default=5,
                         help="Maximum number of objects per instance")
     parser.add_argument("--model", type=str, default="meta-llama/Meta-Llama-3.1-8B-Instruct")
+    parser.add_argument("--twist-scales", type=str, default="0.1,0.3",
+                        help="Comma-separated twist_scale values to test (default: 0.1,0.3)")
     args = parser.parse_args()
 
     asyncio.run(main(args))

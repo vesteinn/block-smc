@@ -169,7 +169,7 @@ class TestCollectTwistTrainingData:
         """Collects examples from all particles at all boundaries."""
         seq = self._make_mock_sequences(n_particles=3, n_units=2)
         hse = self._make_mock_hse(d_model=32)
-        pot = self._make_mock_potential(complete_score=0.0)
+        pot = self._make_mock_potential(complete_score=0.0, prefix_score=0.0)
         buffer = TwistTrainingBuffer()
 
         stats = await collect_twist_training_data(seq, hse, pot, buffer)
@@ -177,21 +177,41 @@ class TestCollectTwistTrainingData:
         # 3 particles × 2 boundaries = 6 examples
         assert stats["n_examples"] == 6
         assert stats["n_particles"] == 3
-        assert stats["n_positive"] == 3  # complete_score=0.0 > -inf → label=1
+        # boundary_level_labels=True: prefix_score=0.0 > -inf at both boundaries → all positive
+        assert stats["n_positive"] == 6
         assert len(buffer) == 6
 
     @pytest.mark.asyncio
     async def test_negative_labels(self):
-        """Particles failing constraint get label=0."""
+        """Particles failing constraint get label=0 at all boundaries."""
         seq = self._make_mock_sequences(n_particles=2, n_units=2)
         hse = self._make_mock_hse()
-        pot = self._make_mock_potential(complete_score=float("-inf"))
+        # Both prefix and complete return -inf → all labels are 0
+        pot = self._make_mock_potential(complete_score=float("-inf"), prefix_score=float("-inf"))
         buffer = TwistTrainingBuffer()
 
         stats = await collect_twist_training_data(seq, hse, pot, buffer)
 
         assert stats["n_positive"] == 0
         assert all(label == 0.0 for label in buffer.labels)
+
+    @pytest.mark.asyncio
+    async def test_mixed_boundary_labels(self):
+        """Prefix succeeds but complete fails → intermediate positive, final negative."""
+        seq = self._make_mock_sequences(n_particles=1, n_units=2)
+        hse = self._make_mock_hse()
+        # Prefix succeeds (valid partial), but complete fails (invalid full sequence)
+        pot = self._make_mock_potential(complete_score=float("-inf"), prefix_score=0.0)
+        buffer = TwistTrainingBuffer()
+
+        stats = await collect_twist_training_data(seq, hse, pot, buffer)
+
+        # Boundary 0 (intermediate): uses prefix() → 0.0 > -inf → positive
+        # Boundary 1 (final with EOS): uses complete() → -inf → negative
+        assert stats["n_examples"] == 2
+        assert stats["n_positive"] == 1
+        assert buffer.labels[0] == 1.0  # intermediate boundary
+        assert buffer.labels[1] == 0.0  # final boundary
 
     @pytest.mark.asyncio
     async def test_skips_zero_weight_particles(self):
@@ -208,8 +228,8 @@ class TestCollectTwistTrainingData:
         assert stats["n_examples"] == 4
 
     @pytest.mark.asyncio
-    async def test_boundary_fracs(self):
-        """Boundary fractions are correctly computed as (k+1)/K."""
+    async def test_boundary_fracs_legacy(self):
+        """Without num_blocks_est, fracs use actual block count: (k+1)/K."""
         seq = self._make_mock_sequences(n_particles=1, n_units=4)
         hse = self._make_mock_hse()
         pot = self._make_mock_potential(complete_score=0.0)
@@ -223,6 +243,44 @@ class TestCollectTwistTrainingData:
             assert abs(actual - exp) < 1e-6
 
     @pytest.mark.asyncio
+    async def test_boundary_fracs_with_num_blocks_est(self):
+        """With num_blocks_est, fracs match inference: (k+1)/num_blocks_est."""
+        seq = self._make_mock_sequences(n_particles=1, n_units=4)
+        hse = self._make_mock_hse()
+        pot = self._make_mock_potential(complete_score=0.0)
+        buffer = TwistTrainingBuffer()
+
+        # Simulate inference K: max_tokens=150, block_size=10 → 15 blocks
+        await collect_twist_training_data(seq, hse, pot, buffer, num_blocks_est=15)
+
+        # 4 boundaries with K=15: fracs should be 1/15, 2/15, 3/15, 4/15
+        expected = [1/15, 2/15, 3/15, 4/15]
+        for actual, exp in zip(buffer.boundary_fracs, expected):
+            assert abs(actual - exp) < 1e-6
+
+    @pytest.mark.asyncio
+    async def test_boundary_fracs_mismatch_exposed(self):
+        """Demonstrate the train/inference mismatch when num_blocks_est differs from actual."""
+        seq = self._make_mock_sequences(n_particles=1, n_units=5)
+        hse = self._make_mock_hse()
+        pot = self._make_mock_potential(complete_score=0.0)
+
+        # Legacy (actual blocks)
+        buf_legacy = TwistTrainingBuffer()
+        await collect_twist_training_data(seq, hse, pot, buf_legacy)
+        # Max frac should be 1.0 (5/5)
+        assert abs(buf_legacy.boundary_fracs[-1] - 1.0) < 1e-6
+
+        # With num_blocks_est=15 (matching inference)
+        buf_fixed = TwistTrainingBuffer()
+        await collect_twist_training_data(seq, hse, pot, buf_fixed, num_blocks_est=15)
+        # Max frac should be 5/15 = 0.333
+        assert abs(buf_fixed.boundary_fracs[-1] - 5/15) < 1e-6
+
+        # The mismatch: legacy fracs go up to 1.0 but inference fracs only reach 0.333
+        assert buf_legacy.boundary_fracs[-1] > buf_fixed.boundary_fracs[-1] * 2
+
+    @pytest.mark.asyncio
     async def test_empty_sequences(self):
         """Handles empty contexts gracefully."""
         seq = MagicMock()
@@ -234,3 +292,39 @@ class TestCollectTwistTrainingData:
 
         stats = await collect_twist_training_data(seq, hse, pot, buffer)
         assert stats["n_examples"] == 0
+
+
+class TestClassBalance:
+    """Test that class balancing in train_twist_step behaves correctly."""
+
+    def test_class_balance_direction(self):
+        """With imbalanced data, class_balance should help minority class accuracy."""
+        d = 32
+        torch.manual_seed(42)
+
+        # Create imbalanced data: 90% positive, 10% negative
+        buf = TwistTrainingBuffer()
+        for i in range(100):
+            h = torch.randn(d)
+            # Negatives have h[0] < -1 (rare), positives have h[0] > -1 (common)
+            label = 0.0 if h[0] < -1.0 else 1.0
+            buf.add(h, weight=1.0, label=label, boundary_frac=0.5)
+
+        n_pos = sum(1 for l in buf.labels if l > 0.5)
+        n_neg = len(buf) - n_pos
+
+        # Train with class balance
+        head_bal = TwistHead(d_model=d, hidden_dim=16)
+        opt_bal = torch.optim.Adam(head_bal.parameters(), lr=1e-3)
+        res_bal = train_twist_step(head_bal, buf, opt_bal, torch.device("cpu"),
+                                   n_epochs=30, class_balance=True)
+
+        # Train without class balance
+        head_nobal = TwistHead(d_model=d, hidden_dim=16)
+        opt_nobal = torch.optim.Adam(head_nobal.parameters(), lr=1e-3)
+        res_nobal = train_twist_step(head_nobal, buf, opt_nobal, torch.device("cpu"),
+                                      n_epochs=30, class_balance=False)
+
+        # Both should train successfully
+        assert res_bal["accuracy"] > 0.5
+        assert res_nobal["accuracy"] > 0.5

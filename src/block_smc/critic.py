@@ -38,6 +38,8 @@ class TwistedBlockCritic(Potential):
         hidden_state_extractor: For extracting h from the LM.
         num_blocks: Expected number of blocks K (for normalising k/K).
             If None, uses the count of completed units as k.
+        twist_scale: Scaling factor α for log(ψ). Default 1.0 (no scaling).
+            Values < 1 temper the twist's influence on resampling weights.
     """
 
     def __init__(
@@ -46,6 +48,7 @@ class TwistedBlockCritic(Potential):
         twist_head: Optional[TwistHead] = None,
         hidden_state_extractor: Optional[HiddenStateExtractor] = None,
         num_blocks: Optional[int] = None,
+        twist_scale: float = 1.0,
     ):
         # Inherit vocabulary from the expensive potential
         super().__init__(
@@ -57,6 +60,7 @@ class TwistedBlockCritic(Potential):
         self.twist_head = twist_head
         self.hidden_state_extractor = hidden_state_extractor
         self.num_blocks = num_blocks
+        self.twist_scale = twist_scale
 
         # Track boundary index and hidden states for training data collection
         self._last_hidden_states: dict[int, list[torch.Tensor]] = {}
@@ -122,11 +126,11 @@ class TwistedBlockCritic(Potential):
 
         h = self.hidden_state_extractor.extract(token_ids, position=-1)
 
-        # Compute log ψ
+        # Compute log ψ, scaled by twist_scale to temper influence on resampling
         with torch.no_grad():
             bf_tensor = torch.tensor([boundary_frac], device=h.device, dtype=h.dtype)
             log_psi = self.twist_head.log_psi(h.unsqueeze(0), bf_tensor)
-            return log_psi.item()
+            return self.twist_scale * log_psi.item()
 
     def get_last_hidden_state(self, context) -> Optional[torch.Tensor]:
         """Extract and return the hidden state for the current context.

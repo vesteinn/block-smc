@@ -299,8 +299,8 @@ async def train_twist_for_domain(
     n_guided = n_train_rounds // 2
     n_explore = n_train_rounds - n_guided
 
-    # Use first 3 instances (or fewer) for training
-    train_instances = instances[:min(3, len(instances))]
+    # Use first 5 instances (or fewer) for training
+    train_instances = instances[:min(5, len(instances))]
 
     for inst_idx, instance in enumerate(train_instances):
         use_chat = "instruct" in llm.model.name.lower() if hasattr(llm.model, 'name') else False
@@ -506,11 +506,11 @@ if __name__ == "__main__":
     parser.add_argument("--n-particles", type=int, default=10)
     parser.add_argument("--max-tokens", type=int, default=150)
     parser.add_argument("--block-size", type=int, default=10)
-    parser.add_argument("--n-train-rounds", type=int, default=6,
+    parser.add_argument("--n-train-rounds", type=int, default=8,
                         help="Training rounds per instance (half guided, half explore)")
-    parser.add_argument("--max-objects", type=int, default=9,
+    parser.add_argument("--max-objects", type=int, default=4,
                         help="Maximum number of objects per instance")
-    parser.add_argument("--model", type=str, default="meta-llama/Llama-3.2-1B-Instruct")
+    parser.add_argument("--model", type=str, default="meta-llama/Meta-Llama-3.1-8B-Instruct")
     args = parser.parse_args()
 
     asyncio.run(main(args))

@@ -175,6 +175,7 @@ async def collect_twist_training_data(
     hidden_state_extractor,
     expensive_potential,
     buffer: TwistTrainingBuffer,
+    boundary_level_labels: bool = True,
 ):
     """Collect twist training data from completed Block SMC results.
 
@@ -182,14 +183,20 @@ async def collect_twist_training_data(
         - Extract h from the LM at the boundary position
         - Record (h, normalised_weight, label, k/K)
 
-    The label y=1 if the complete sequence satisfies Φ (expensive potential
-    returns finite score), y=0 otherwise.
+    When boundary_level_labels=True (default), labels are computed per-boundary
+    by evaluating expensive_potential.prefix() at each boundary position. This
+    gives direct supervision: "at boundary k, is the prefix still viable?"
+
+    When boundary_level_labels=False, a single global label is computed for the
+    full sequence and applied to all boundaries (legacy behavior).
 
     Args:
         sequences: Sequences object from Block SMC run (contexts are nested units).
         hidden_state_extractor: HiddenStateExtractor for the LM.
         expensive_potential: Coerced Φ_exp potential (operates on flat LLM tokens).
         buffer: TwistTrainingBuffer to populate.
+        boundary_level_labels: If True, evaluate prefix at each boundary for
+            per-boundary labels. If False, use global sequence label.
 
     Returns:
         Dict with collection stats: n_examples, n_positive, n_particles.
@@ -215,21 +222,21 @@ async def collect_twist_training_data(
         if not units:
             continue
 
-        # Evaluate full sequence: does it satisfy Φ?
+        # Pre-compute global label (used when boundary_level_labels=False,
+        # and for the final boundary when boundary_level_labels=True)
         flat_all = _flatten_context(ctx)
         has_eos = any(isinstance(t, EndOfSequence) for t in flat_all)
-        byte_tokens = [t for t in flat_all if isinstance(t, bytes)]
+        all_byte_tokens = [t for t in flat_all if isinstance(t, bytes)]
 
-        if has_eos and byte_tokens:
-            # Complete sequence → evaluate with complete()
-            complete_score = await expensive_potential.complete(byte_tokens)
-            label = 1.0 if complete_score > float("-inf") else 0.0
-        else:
-            # Incomplete → evaluate prefix
-            prefix_score = await expensive_potential.prefix(byte_tokens)
-            label = 1.0 if prefix_score > float("-inf") else 0.0
+        global_label = None
+        if not boundary_level_labels:
+            if has_eos and all_byte_tokens:
+                complete_score = await expensive_potential.complete(all_byte_tokens)
+                global_label = 1.0 if complete_score > float("-inf") else 0.0
+            else:
+                prefix_score = await expensive_potential.prefix(all_byte_tokens)
+                global_label = 1.0 if prefix_score > float("-inf") else 0.0
 
-        n_positive += int(label)
         K = len(units)
 
         # Extract hidden state at each block boundary
@@ -244,6 +251,19 @@ async def collect_twist_training_data(
             if not token_ids:
                 continue
 
+            # Compute label for this boundary
+            if boundary_level_labels:
+                is_final = (k == K - 1)
+                if is_final and has_eos:
+                    # Final boundary with EOS: use complete()
+                    score = await expensive_potential.complete(byte_toks)
+                else:
+                    # Intermediate boundary (or final without EOS): use prefix()
+                    score = await expensive_potential.prefix(byte_toks)
+                label = 1.0 if score > float("-inf") else 0.0
+            else:
+                label = global_label
+
             h = hidden_state_extractor.extract(token_ids, position=-1)
             boundary_frac = (k + 1) / K
 
@@ -254,6 +274,7 @@ async def collect_twist_training_data(
                 boundary_frac=boundary_frac,
             )
             n_examples += 1
+            n_positive += int(label)
 
     return {
         "n_examples": n_examples,
@@ -270,10 +291,14 @@ def train_twist_step(
     n_epochs: int = 5,
     batch_size: int = 256,
     discount: float = 0.9,
+    class_balance: bool = True,
 ) -> dict:
     """Train the twist head on buffered data via weighted BCE.
 
-    Loss: L = -Σ_i w_i [y_i log ψ(h_i, k_i) + (1-y_i) log(1 - ψ(h_i, k_i))]
+    Loss: L = Σ_i w_i · bce_i / Σ_i w_i
+
+    With class_balance=True, positive-class BCE terms are scaled by n_neg/n_pos
+    to compensate for class imbalance in the training buffer.
 
     Args:
         twist_head: The TwistHead module.
@@ -283,6 +308,7 @@ def train_twist_step(
         n_epochs: Number of passes over the buffer.
         batch_size: Mini-batch size.
         discount: Age discount factor.
+        class_balance: If True, apply pos_weight = n_neg / n_pos to balance classes.
 
     Returns:
         Dict with 'loss' (final epoch average) and 'accuracy' (on training set).
@@ -292,6 +318,14 @@ def train_twist_step(
 
     h, w, y, bf = buffer.to_tensors(device, discount=discount)
     n = h.shape[0]
+
+    # Compute class balance weight
+    n_pos = (y > 0.5).sum().item()
+    n_neg = (y <= 0.5).sum().item()
+    if class_balance and n_pos > 0 and n_neg > 0:
+        pos_weight = n_neg / n_pos
+    else:
+        pos_weight = 1.0
 
     twist_head.train()
     total_loss = 0.0
@@ -307,12 +341,14 @@ def train_twist_step(
             bf_batch = bf[idx]
 
             psi = twist_head(h_batch, bf_batch)
-            # Weighted BCE
+            # Weighted BCE with class balancing
             eps = 1e-7
-            bce = -(
-                y_batch * torch.log(psi + eps) + (1 - y_batch) * torch.log(1 - psi + eps)
-            )
-            loss = (w_batch * bce).mean()
+            bce_pos = -y_batch * torch.log(psi + eps)
+            bce_neg = -(1 - y_batch) * torch.log(1 - psi + eps)
+            bce = pos_weight * bce_pos + bce_neg
+
+            # Proper normalization: weighted sum / weight sum
+            loss = (w_batch * bce).sum() / (w_batch.sum() + 1e-8)
 
             optimizer.zero_grad()
             loss.backward()
@@ -330,4 +366,4 @@ def train_twist_step(
         accuracy = (predictions == y).float().mean().item()
         avg_loss = total_loss / max(n_batches, 1)
 
-    return {"loss": avg_loss, "accuracy": accuracy}
+    return {"loss": avg_loss, "accuracy": accuracy, "n_pos": n_pos, "n_neg": n_neg, "pos_weight": pos_weight}

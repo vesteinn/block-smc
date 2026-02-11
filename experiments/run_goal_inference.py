@@ -43,7 +43,7 @@ from genlm.eval.core import EvaluationResult
 
 from block_smc.sampler import make_block_smc, run_block_smc, decode_block_sequences
 from block_smc.boundary import FixedIntervalBoundary
-from block_smc.twist import TwistHead, TwistTrainingBuffer, train_twist_step, collect_twist_training_data
+from block_smc.twist import TwistHead, TwistTrainingBuffer, train_twist_step, collect_twist_training_data, adapt_twist_online, restore_twist_weights
 from block_smc.hidden_states import HiddenStateExtractor
 
 
@@ -265,6 +265,34 @@ async def run_single_instance(
         )
         seq = await run_block_smc(smc, n_particles=n_particles, ess_threshold=ess_threshold, max_tokens=max_tokens)
         posterior = decode_block_sequences(seq)
+    elif method_name == "block_twist_online":
+        # Block SMC, learned twist + per-instance online adaptation
+        num_blocks_est = max(max_tokens // block_size, 1)
+        smc = make_block_smc(
+            token_sampler=token_sampler,
+            boundary_predicate=FixedIntervalBoundary(block_size),
+            expensive_potential=expensive, llm=local_llm,
+            twist_head=twist_head, hidden_state_extractor=hse,
+            num_blocks=num_blocks_est,
+        )
+        # Save pretrained weights
+        pretrained_state = {k: v.clone() for k, v in twist_head.state_dict().items()}
+
+        # Phase 1: run SMC with pretrained twist
+        seq_phase1 = await run_block_smc(smc, n_particles=n_particles, ess_threshold=ess_threshold, max_tokens=max_tokens)
+
+        # Adapt twist to this instance
+        adapt_buffer = TwistTrainingBuffer()
+        await collect_twist_training_data(seq_phase1, hse, coerced, adapt_buffer)
+        device = next(twist_head.parameters()).device
+        adapt_result = adapt_twist_online(twist_head, adapt_buffer, device)
+
+        # Phase 2: run SMC with adapted twist
+        seq = await run_block_smc(smc, n_particles=n_particles, ess_threshold=ess_threshold, max_tokens=max_tokens)
+        posterior = decode_block_sequences(seq)
+
+        # Restore pretrained weights for next instance
+        restore_twist_weights(twist_head, pretrained_state)
     else:
         raise ValueError(f"Unknown method: {method_name}")
 
@@ -413,7 +441,7 @@ async def main(args):
     # =========================================================================
     # PHASE 2: EVALUATE (on held-out instances only)
     # =========================================================================
-    methods = ["baseline", "block_vanilla", "block_twist"]
+    methods = ["baseline", "block_vanilla", "block_twist", "block_twist_online"]
     all_results = {m: [] for m in methods}
 
     print(f"\n{'='*70}")
@@ -432,19 +460,19 @@ async def main(args):
                     evaluator=evaluator,
                     n_particles=N, max_tokens=T, ess_threshold=0.9,
                     block_size=BS,
-                    twist_head=twist_head if method == "block_twist" else None,
-                    hse=hse if method == "block_twist" else None,
+                    twist_head=twist_head if method in ("block_twist", "block_twist_online") else None,
+                    hse=hse if method in ("block_twist", "block_twist_online") else None,
                     seed=42 + inst_idx,
                 )
                 all_results[method].append(result)
-                print(f"  {method:<15} acc={result['accuracy']:.0f}  "
+                print(f"  {method:<20} acc={result['accuracy']:.0f}  "
                       f"log_Z={result['log_ml']:.2f}  "
                       f"ess={result['ess']:.1f}  "
                       f"time={result['wall_time']:.1f}s  "
                       f"uniq={result['n_unique']}  "
                       f"best='{result['best_response'][:50]}'")
             except Exception as e:
-                print(f"  {method:<15} FAILED: {e}")
+                print(f"  {method:<20} FAILED: {e}")
                 all_results[method].append({
                     "log_ml": float("-inf"), "ess": 0.0,
                     "wall_time": 0.0, "accuracy": 0.0,
@@ -462,8 +490,9 @@ async def main(args):
 
     method_labels = {
         "baseline": "Baseline (token-level)",
-        "block_vanilla": f"Block SMC (vanilla, BS={BS})",
-        "block_twist": f"Block SMC (twist, BS={BS})",
+        "block_vanilla": f"Block (vanilla, BS={BS})",
+        "block_twist": f"Block (twist, BS={BS})",
+        "block_twist_online": f"Block (online, BS={BS})",
     }
 
     # Compute metrics

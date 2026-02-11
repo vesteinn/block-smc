@@ -367,3 +367,103 @@ def train_twist_step(
         avg_loss = total_loss / max(n_batches, 1)
 
     return {"loss": avg_loss, "accuracy": accuracy, "n_pos": n_pos, "n_neg": n_neg, "pos_weight": pos_weight}
+
+
+def adapt_twist_online(
+    twist_head: TwistHead,
+    buffer: TwistTrainingBuffer,
+    device: torch.device,
+    n_epochs: int = 3,
+    batch_size: int = 64,
+    lr: float = 1e-4,
+    l2_weight: float = 0.1,
+    discount: float = 1.0,
+) -> dict:
+    """Adapt twist head to a specific instance using particles from one SMC sweep.
+
+    Two-phase inference: run SMC once with pretrained twist, collect particles,
+    adapt twist with a few gradient steps + L2 penalty back to pretrained weights,
+    then run SMC again with the adapted twist.
+
+    The L2 penalty prevents overconfidence/diversity collapse by anchoring the
+    adapted twist near the pretrained parameters.
+
+    Args:
+        twist_head: The TwistHead module (modified in-place).
+        buffer: Training data from one SMC sweep on this instance.
+        device: Compute device.
+        n_epochs: Number of passes over the buffer (keep small: 2-5).
+        batch_size: Mini-batch size.
+        lr: Learning rate (smaller than pretraining LR).
+        l2_weight: Weight on L2 penalty ||θ - θ_pretrained||².
+        discount: Age discount (1.0 = no discount, appropriate for single-sweep data).
+
+    Returns:
+        Dict with adaptation stats.
+    """
+    if len(buffer) == 0:
+        return {"loss": float("nan"), "adapted": False, "n_examples": 0}
+
+    # Save pretrained weights as anchor
+    anchor = {k: v.clone() for k, v in twist_head.state_dict().items()}
+    optimizer = torch.optim.Adam(twist_head.parameters(), lr=lr)
+
+    twist_head.train()
+    for p in twist_head.parameters():
+        p.requires_grad_(True)
+
+    h, w, y, bf = buffer.to_tensors(device, discount=discount)
+    n = h.shape[0]
+
+    # Class balancing
+    n_pos = (y > 0.5).sum().item()
+    n_neg = (y <= 0.5).sum().item()
+    pos_weight = n_neg / n_pos if n_pos > 0 and n_neg > 0 else 1.0
+
+    total_loss = 0.0
+    n_batches = 0
+    for _ in range(n_epochs):
+        perm = torch.randperm(n, device=device)
+        for start in range(0, n, batch_size):
+            idx = perm[start : start + batch_size]
+            h_batch, w_batch, y_batch, bf_batch = h[idx], w[idx], y[idx], bf[idx]
+
+            psi = twist_head(h_batch, bf_batch)
+            eps = 1e-7
+            bce_pos = -y_batch * torch.log(psi + eps)
+            bce_neg = -(1 - y_batch) * torch.log(1 - psi + eps)
+            bce = pos_weight * bce_pos + bce_neg
+            bce_loss = (w_batch * bce).sum() / (w_batch.sum() + 1e-8)
+
+            # L2 penalty: ||θ - θ_pretrained||²
+            l2_loss = sum(
+                ((p - anchor[k].to(device)) ** 2).sum()
+                for k, p in twist_head.named_parameters()
+            )
+            loss = bce_loss + l2_weight * l2_loss
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+            n_batches += 1
+
+    twist_head.eval()
+    for p in twist_head.parameters():
+        p.requires_grad_(False)
+
+    return {
+        "loss": total_loss / max(n_batches, 1),
+        "n_examples": n,
+        "n_pos": n_pos,
+        "n_neg": n_neg,
+        "adapted": True,
+    }
+
+
+def restore_twist_weights(twist_head: TwistHead, state_dict: dict):
+    """Restore twist head to pretrained weights (undo online adaptation)."""
+    twist_head.load_state_dict(state_dict)
+    twist_head.eval()
+    for p in twist_head.parameters():
+        p.requires_grad_(False)

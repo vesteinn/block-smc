@@ -10,21 +10,44 @@ from block_smc.boundary import (
 )
 from block_smc.hidden_states import HiddenStateExtractor, HiddenStateCache
 from block_smc.sampler import make_block_smc, run_block_smc, decode_block_sequences
+from block_smc.boundary_learning import (
+    optimize_boundaries_dp,
+    local_search,
+    make_initial_boundaries,
+    is_valid_segmentation,
+    get_block_sizes,
+)
+from block_smc.em import EMConfig, EMHistory, run_em
 
 __all__ = [
+    # Twist
     "TwistHead",
     "TwistTrainingBuffer",
     "train_twist_step",
     "collect_twist_training_data",
+    # Critics
     "TwistedBlockCritic",
     "OracleTwistCritic",
+    # Boundaries
     "PositionListBoundary",
     "FixedIntervalBoundary",
     "SMILESBoundary",
     "SQLClauseBoundary",
+    # Hidden states
     "HiddenStateExtractor",
     "HiddenStateCache",
+    # Pipeline
     "make_block_smc",
     "run_block_smc",
     "decode_block_sequences",
+    # Boundary learning
+    "optimize_boundaries_dp",
+    "local_search",
+    "make_initial_boundaries",
+    "is_valid_segmentation",
+    "get_block_sizes",
+    # EM
+    "EMConfig",
+    "EMHistory",
+    "run_em",
 ]

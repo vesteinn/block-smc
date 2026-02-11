@@ -299,10 +299,7 @@ async def train_twist_for_domain(
     n_guided = n_train_rounds // 2
     n_explore = n_train_rounds - n_guided
 
-    # Use first 5 instances (or fewer) for training
-    train_instances = instances[:min(5, len(instances))]
-
-    for inst_idx, instance in enumerate(train_instances):
+    for inst_idx, instance in enumerate(instances):
         use_chat = "instruct" in llm.model.name.lower() if hasattr(llm.model, 'name') else False
         prompt_ids = make_prompt(llm.model.tokenizer, instance, use_chat_format=use_chat)
         llm.prompt_ids = prompt_ids
@@ -372,12 +369,23 @@ async def main(args):
     grammar = BoolCFG.from_lark(grammar_text)
     domain_text = DOMAIN_PATH.read_text()
 
-    print(f"Loading dataset: {args.n_instances} instances from Planetarium")
+    # Load all available instances, then split train/eval
+    total_needed = args.n_train_instances + args.n_eval_instances
+    print(f"Loading dataset: {total_needed} instances from Planetarium (max_objects={args.max_objects})")
     ds = GoalInferenceDataset.from_hf_planetarium(
-        n_examples=args.n_instances, max_objects=args.max_objects, domains=["blocksworld"]
+        n_examples=total_needed, max_objects=args.max_objects, domains=["blocksworld"]
     )
-    instances = list(ds)
-    print(f"Loaded {len(instances)} instances")
+    all_instances = list(ds)
+    print(f"Loaded {len(all_instances)} instances")
+
+    n_train = min(args.n_train_instances, len(all_instances))
+    train_instances = all_instances[:n_train]
+    eval_instances = all_instances[n_train:]
+    print(f"Split: {len(train_instances)} train, {len(eval_instances)} eval (non-overlapping)")
+
+    if len(eval_instances) == 0:
+        print("WARNING: No eval instances! Increase --max-objects or decrease --n-train-instances")
+        return
 
     evaluator = GoalInferenceEvaluatorWithTools()
     hse = HiddenStateExtractor(llm)
@@ -390,12 +398,12 @@ async def main(args):
     # PHASE 1: TRAIN TWIST
     # =========================================================================
     print(f"\n{'='*70}")
-    print(f"PHASE 1: TRAINING TWIST (block_size={BS}, N={N})")
+    print(f"PHASE 1: TRAINING TWIST (block_size={BS}, N={N}, {len(train_instances)} train instances)")
     print(f"{'='*70}")
 
     train_t0 = time.time()
     twist_head, train_result, train_stats = await train_twist_for_domain(
-        instances, llm, grammar, domain_text, hse,
+        train_instances, llm, grammar, domain_text, hse,
         n_particles=N, max_tokens=T, block_size=BS,
         n_train_rounds=args.n_train_rounds,
     )
@@ -403,17 +411,17 @@ async def main(args):
     print(f"  Training time: {train_time:.1f}s")
 
     # =========================================================================
-    # PHASE 2: EVALUATE
+    # PHASE 2: EVALUATE (on held-out instances only)
     # =========================================================================
     methods = ["baseline", "block_vanilla", "block_twist"]
     all_results = {m: [] for m in methods}
 
     print(f"\n{'='*70}")
-    print(f"PHASE 2: EVALUATION ({len(instances)} instances, N={N}, T={T}, BS={BS})")
+    print(f"PHASE 2: EVALUATION ({len(eval_instances)} held-out instances, N={N}, T={T}, BS={BS})")
     print(f"{'='*70}")
 
-    for inst_idx, instance in enumerate(instances):
-        print(f"\n--- Instance {inst_idx} (id={instance.instance_id}): {instance.nl_goal[:80]}... ---")
+    for inst_idx, instance in enumerate(eval_instances):
+        print(f"\n--- Eval {inst_idx} (id={instance.instance_id}): {instance.nl_goal[:80]}... ---")
 
         for method in methods:
             try:
@@ -448,8 +456,8 @@ async def main(args):
     # SUMMARY TABLE
     # =========================================================================
     print(f"\n{'='*70}")
-    print(f"SUMMARY (Goal Inference / Planetarium, {len(instances)} instances, N={N}, T={T}, BS={BS})")
-    print(f"Training: {train_stats['buffer_size']} examples ({train_stats['n_pos']}+/{train_stats['n_neg']}-), {train_time:.1f}s")
+    print(f"SUMMARY (Goal Inference / Planetarium, {len(eval_instances)} eval instances, N={N}, T={T}, BS={BS})")
+    print(f"Training: {len(train_instances)} instances, {train_stats['buffer_size']} examples ({train_stats['n_pos']}+/{train_stats['n_neg']}-), {train_time:.1f}s")
     print(f"{'='*70}")
 
     method_labels = {
@@ -477,9 +485,11 @@ async def main(args):
     # Save
     output = {
         "config": {
-            "n_instances": len(instances),
+            "n_train_instances": len(train_instances),
+            "n_eval_instances": len(eval_instances),
             "n_particles": N, "max_tokens": T, "block_size": BS,
             "model": args.model, "n_train_rounds": args.n_train_rounds,
+            "max_objects": args.max_objects,
         },
         "training": {
             "buffer_size": train_stats["buffer_size"],
@@ -502,13 +512,16 @@ async def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--n-instances", type=int, default=10)
+    parser.add_argument("--n-train-instances", type=int, default=5,
+                        help="Number of instances for twist training")
+    parser.add_argument("--n-eval-instances", type=int, default=24,
+                        help="Number of held-out instances for evaluation")
     parser.add_argument("--n-particles", type=int, default=10)
     parser.add_argument("--max-tokens", type=int, default=150)
     parser.add_argument("--block-size", type=int, default=10)
     parser.add_argument("--n-train-rounds", type=int, default=8,
                         help="Training rounds per instance (half guided, half explore)")
-    parser.add_argument("--max-objects", type=int, default=4,
+    parser.add_argument("--max-objects", type=int, default=5,
                         help="Maximum number of objects per instance")
     parser.add_argument("--model", type=str, default="meta-llama/Meta-Llama-3.1-8B-Instruct")
     args = parser.parse_args()

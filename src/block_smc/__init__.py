@@ -9,7 +9,7 @@ from block_smc.boundary import (
     SQLClauseBoundary,
 )
 from block_smc.hidden_states import HiddenStateExtractor, HiddenStateCache
-from block_smc.sampler import make_block_smc, run_block_smc
+from block_smc.sampler import make_block_smc, run_block_smc, decode_block_sequences
 
 __all__ = [
     "TwistHead",
@@ -25,4 +25,5 @@ __all__ = [
     "HiddenStateCache",
     "make_block_smc",
     "run_block_smc",
+    "decode_block_sequences",
 ]

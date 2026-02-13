@@ -13,31 +13,59 @@ from dataclasses import dataclass, field
 
 
 class TwistHead(nn.Module):
-    """MLP predicting P(constraint satisfied | LM hidden state at boundary).
+    """MLP or linear probe predicting P(constraint satisfied | LM hidden state at boundary).
 
-    Architecture:
-        [h; k/K] → Linear(d_model+1, hidden) → ReLU → Linear(hidden, hidden) → ReLU → Linear(hidden, 1) → Sigmoid
+    Architecture (hidden_dim > 0, default):
+        [h; k/K] → Linear(d+1, hidden) → ReLU → Dropout → Linear(hidden, hidden) → ReLU → Dropout → Linear(hidden, 1) → Sigmoid
+
+    Architecture (hidden_dim == 0, linear probe):
+        [h; k/K] → Dropout → Linear(d+1, 1) → Sigmoid
 
     The input is the LM last-layer hidden state h concatenated with the
     normalised boundary fraction k/K. Output is ψ ∈ (0, 1).
 
     Args:
         d_model: Hidden dimension of the language model.
-        hidden_dim: Width of the MLP hidden layers. Default 256.
+        hidden_dim: Width of the MLP hidden layers. 0 = linear probe. Default 256.
+        dropout: Dropout probability applied during training. Default 0.0.
+        logit_clamp: Max absolute logit value before sigmoid. Prevents catastrophic
+            extrapolation on OOD hidden states. Default 3.0 → ψ ∈ [0.047, 0.953].
+            Set to 0 to disable clamping.
     """
 
-    def __init__(self, d_model: int, hidden_dim: int = 256):
+    def __init__(self, d_model: int, hidden_dim: int = 256, dropout: float = 0.0, logit_clamp: float = 3.0):
         super().__init__()
         self.d_model = d_model
         self.hidden_dim = hidden_dim
+        self.dropout = dropout
+        self.logit_clamp = logit_clamp
         # +1 for boundary fraction k/K
-        self.net = nn.Sequential(
-            nn.Linear(d_model + 1, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
-        )
+        if hidden_dim > 0:
+            self.net = nn.Sequential(
+                nn.Linear(d_model + 1, hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, 1),
+            )
+        else:
+            # Linear probe
+            self.net = nn.Sequential(
+                nn.Dropout(dropout),
+                nn.Linear(d_model + 1, 1),
+            )
+
+    def _logits(self, h: torch.Tensor, boundary_frac: torch.Tensor) -> torch.Tensor:
+        """Compute raw logits, optionally clamped."""
+        if boundary_frac.dim() < h.dim():
+            boundary_frac = boundary_frac.unsqueeze(-1)
+        x = torch.cat([h, boundary_frac], dim=-1)
+        logits = self.net(x).squeeze(-1)
+        if self.logit_clamp > 0:
+            logits = logits.clamp(-self.logit_clamp, self.logit_clamp)
+        return logits
 
     def forward(self, h: torch.Tensor, boundary_frac: torch.Tensor) -> torch.Tensor:
         """Compute twist value ψ(h, k/K).
@@ -49,21 +77,14 @@ class TwistHead(nn.Module):
         Returns:
             ψ values in (0, 1), same batch shape as input.
         """
-        if boundary_frac.dim() < h.dim():
-            boundary_frac = boundary_frac.unsqueeze(-1)
-        x = torch.cat([h, boundary_frac], dim=-1)
-        return torch.sigmoid(self.net(x)).squeeze(-1)
+        return torch.sigmoid(self._logits(h, boundary_frac))
 
     def log_psi(self, h: torch.Tensor, boundary_frac: torch.Tensor) -> torch.Tensor:
         """Compute log ψ(h, k/K) with numerical stability.
 
         Uses log-sigmoid to avoid log(0).
         """
-        if boundary_frac.dim() < h.dim():
-            boundary_frac = boundary_frac.unsqueeze(-1)
-        x = torch.cat([h, boundary_frac], dim=-1)
-        logits = self.net(x).squeeze(-1)
-        return nn.functional.logsigmoid(logits)
+        return nn.functional.logsigmoid(self._logits(h, boundary_frac))
 
 
 @dataclass

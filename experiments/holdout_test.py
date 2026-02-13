@@ -31,7 +31,10 @@ from genlm.eval.domains.goal_inference import (
 
 from block_smc.sampler import make_block_smc, run_block_smc, decode_block_sequences
 from block_smc.boundary import FixedIntervalBoundary
-from block_smc.twist import TwistHead, TwistTrainingBuffer, train_twist_step, collect_twist_training_data
+from block_smc.twist import (
+    TwistHead, TwistTrainingBuffer, train_twist_step, collect_twist_training_data,
+    adapt_twist_online, restore_twist_weights,
+)
 from block_smc.hidden_states import HiddenStateExtractor
 
 from run_goal_inference import (
@@ -182,8 +185,15 @@ async def collect_training_data(
 async def eval_single_instance(
     method_name, instance, llm, grammar, hse, evaluator,
     n_particles, max_tokens, block_size, twist_head=None, twist_scale=1.0, seed=42,
+    online_config=None,
 ):
-    """Evaluate a single method on a single instance. Returns result dict."""
+    """Evaluate a single method on a single instance. Returns result dict.
+
+    Args:
+        online_config: If not None, dict with keys {n_epochs, lr, l2_weight, pretrained_state}
+            for two-phase online adaptation. Phase 1 runs SMC with pretrained twist,
+            collects training data, adapts twist, then Phase 2 runs SMC again.
+    """
     domain_text = DOMAIN_PATH.read_text()
     num_blocks_est = max(max_tokens // block_size, 1)
 
@@ -233,8 +243,43 @@ async def eval_single_instance(
         smc = SMC(unit_sampler, critic=coerced_nested)
         seq = await smc(n_particles=n_particles, ess_threshold=0.9, max_tokens=max_tokens)
         posterior = decoded_posterior_nested(seq)
+    elif online_config is not None and twist_head is not None:
+        # Two-phase online adaptation
+        pretrained_state = online_config["pretrained_state"]
+
+        # Phase 1: run Block SMC with pretrained twist
+        smc = make_block_smc(
+            token_sampler=token_sampler,
+            boundary_predicate=FixedIntervalBoundary(block_size),
+            expensive_potential=expensive, llm=local_llm,
+            twist_head=twist_head, hidden_state_extractor=hse,
+            num_blocks=num_blocks_est, twist_scale=twist_scale,
+        )
+        seq_p1 = await run_block_smc(smc, n_particles=n_particles, ess_threshold=0.9, max_tokens=max_tokens)
+
+        # Collect training data from phase 1 particles
+        adapt_buffer = TwistTrainingBuffer()
+        await collect_twist_training_data(
+            seq_p1, hse, coerced, adapt_buffer, num_blocks_est=num_blocks_est,
+        )
+
+        # Adapt twist to this instance (modifies twist_head in-place)
+        adapt_result = adapt_twist_online(
+            twist_head, adapt_buffer, device=hse.device,
+            n_epochs=online_config.get("n_epochs", 3),
+            lr=online_config.get("lr", 1e-4),
+            l2_weight=online_config.get("l2_weight", 0.1),
+        )
+
+        # Phase 2: run Block SMC with adapted twist (same smc object, twist updated in-place)
+        seq = await run_block_smc(smc, n_particles=n_particles, ess_threshold=0.9, max_tokens=max_tokens)
+        posterior = decode_block_sequences(seq)
+
+        # Restore pretrained weights for next instance
+        restore_twist_weights(twist_head, pretrained_state)
+
     elif twist_head is not None:
-        # Block SMC with twist
+        # Block SMC with twist (no online adaptation)
         smc = make_block_smc(
             token_sampler=token_sampler,
             boundary_predicate=FixedIntervalBoundary(block_size),
@@ -339,13 +384,31 @@ async def main(args):
         print(f"Loading twist weights from {args.load_twist}")
         print(f"{'='*60}")
         checkpoint = torch.load(args.load_twist, map_location=hse.device)
-        twist = TwistHead(d_model=hse.hidden_dim, hidden_dim=checkpoint.get("hidden_dim", 256)).to(hse.device)
+        lc = args.logit_clamp
+        # Load MLP twist
+        twist = TwistHead(d_model=hse.hidden_dim, hidden_dim=checkpoint.get("hidden_dim", 256), logit_clamp=lc).to(hse.device)
         twist.load_state_dict(checkpoint["state_dict"])
         twist.eval()
         for p in twist.parameters():
             p.requires_grad_(False)
+        # Load linear probe twist (if available in checkpoint)
+        if "linear_state_dict" in checkpoint:
+            twist_linear = TwistHead(
+                d_model=hse.hidden_dim,
+                hidden_dim=checkpoint.get("linear_hidden_dim", 0),
+                dropout=checkpoint.get("linear_dropout", 0.3),
+                logit_clamp=lc,
+            ).to(hse.device)
+            twist_linear.load_state_dict(checkpoint["linear_state_dict"])
+            twist_linear.eval()
+            for p in twist_linear.parameters():
+                p.requires_grad_(False)
+            print(f"  Loaded MLP + linear probe twists (logit_clamp={lc}).")
+        else:
+            twist_linear = None
+            print(f"  Loaded MLP twist only (logit_clamp={lc}).")
         twist_config = checkpoint.get("train_config", {})
-        print(f"  Loaded. Config: {twist_config}")
+        print(f"  Config: {twist_config}")
     else:
         print(f"\n{'='*60}")
         print(f"Phase 1: Collecting training data from {len(train_instances)} instances")
@@ -370,7 +433,11 @@ async def main(args):
 
         buf_train = copy.deepcopy(buffer)
         buf_train.boundary_fracs = [0.0] * len(buf_train)  # bf=False
-        twist = TwistHead(d_model=hse.hidden_dim, hidden_dim=256).to(hse.device)
+
+        # Train MLP twist (2-layer, 256 hidden, no dropout)
+        lc = args.logit_clamp
+        print(f"  Training MLP twist (hidden_dim=256, dropout=0.0, logit_clamp={lc})...")
+        twist = TwistHead(d_model=hse.hidden_dim, hidden_dim=256, dropout=0.0, logit_clamp=lc).to(hse.device)
         opt = torch.optim.Adam(twist.parameters(), lr=5e-3)
         res = train_twist_step(twist, buf_train, opt, hse.device,
                                 n_epochs=50, batch_size=64,
@@ -378,73 +445,168 @@ async def main(args):
         twist.eval()
         for p in twist.parameters():
             p.requires_grad_(False)
-        print(f"  Twist: loss={res['loss']:.4f} acc={res['accuracy']:.3f} (n_pos={res['n_pos']}, n_neg={res['n_neg']})")
+        print(f"    MLP: loss={res['loss']:.4f} acc={res['accuracy']:.3f} (n_pos={res['n_pos']}, n_neg={res['n_neg']})")
+
+        # Train linear probe (no hidden layers, dropout=0.3)
+        print("  Training linear probe (hidden_dim=0, dropout=0.3)...")
+        buf_train2 = copy.deepcopy(buffer)
+        buf_train2.boundary_fracs = [0.0] * len(buf_train2)  # bf=False
+        twist_linear = TwistHead(d_model=hse.hidden_dim, hidden_dim=0, dropout=0.3, logit_clamp=lc).to(hse.device)
+        opt_linear = torch.optim.Adam(twist_linear.parameters(), lr=5e-3)
+        res_linear = train_twist_step(twist_linear, buf_train2, opt_linear, hse.device,
+                                       n_epochs=50, batch_size=64,
+                                       class_balance=True, uniform_weights=True)
+        twist_linear.eval()
+        for p in twist_linear.parameters():
+            p.requires_grad_(False)
+        print(f"    Linear: loss={res_linear['loss']:.4f} acc={res_linear['accuracy']:.3f} (n_pos={res_linear['n_pos']}, n_neg={res_linear['n_neg']})")
 
         twist_config = {
             "bf": False, "cb": True, "lr": 5e-3, "ep": 50,
-            "uniform_weights": True, "twist_acc": res["accuracy"],
-            "twist_loss": res["loss"], "n_train": len(train_instances),
+            "uniform_weights": True,
+            "mlp_acc": res["accuracy"], "mlp_loss": res["loss"],
+            "linear_acc": res_linear["accuracy"], "linear_loss": res_linear["loss"],
+            "n_train": len(train_instances),
             "buffer_size": len(buffer), "n_pos": res["n_pos"], "n_neg": res["n_neg"],
             "data_collection_time": data_time,
         }
 
-        # Save twist weights
+        # Save twist weights (both architectures)
         save_path = args.save_twist or str(Path(__file__).parent / f"twist_weights_obj{args.max_objects}.pt")
         torch.save({
             "state_dict": twist.state_dict(),
             "hidden_dim": 256,
             "d_model": hse.hidden_dim,
             "train_config": twist_config,
+            "linear_state_dict": twist_linear.state_dict(),
+            "linear_hidden_dim": 0,
+            "linear_dropout": 0.3,
         }, save_path)
         print(f"  Saved twist weights to {save_path}")
 
     # ---- Phase 3: Evaluate on fresh test set ----
+    n_seeds = args.n_seeds
     print(f"\n{'='*60}")
-    print(f"Phase 3: Evaluating on {n_test} FRESH test instances")
+    print(f"Phase 3: Evaluating on {n_test} FRESH test instances ({n_seeds} seed{'s' if n_seeds > 1 else ''} each)")
     print(f"{'='*60}")
 
-    # Methods to evaluate
+    # Online adaptation config
+    online_cfg = {
+        "n_epochs": args.online_epochs,
+        "lr": args.online_lr,
+        "l2_weight": args.online_l2,
+    }
+
+    # Save pretrained state dicts for online methods (restored after each instance)
+    pretrained_mlp_state = {k: v.clone() for k, v in twist.state_dict().items()}
+    online_cfg_mlp = {**online_cfg, "pretrained_state": pretrained_mlp_state}
+    if twist_linear is not None:
+        pretrained_lin_state = {k: v.clone() for k, v in twist_linear.state_dict().items()}
+        online_cfg_lin = {**online_cfg, "pretrained_state": pretrained_lin_state}
+
+    ts = args.twist_scale
+
+    # Methods to evaluate: (name, twist_head, twist_scale, online_config)
     methods = [
-        ("baseline", None, 0.0),        # token-level SMC
-        ("bracket", None, 0.0),          # unit-level SMC, bracket boundaries
-        ("vanilla", None, 0.0),          # block SMC, fixed-interval boundaries
-        ("twist_s0.1", twist, 0.1),      # block SMC + learned twist
+        ("baseline", None, 0.0, None),
+        ("bracket", None, 0.0, None),
+        ("vanilla", None, 0.0, None),
+        (f"twist_mlp_s{ts}", twist, ts, None),
+        (f"online_mlp_s{ts}", twist, ts, online_cfg_mlp),
     ]
+    if twist_linear is not None:
+        methods.append((f"twist_lin_s{ts}", twist_linear, ts, None))
+        methods.append((f"online_lin_s{ts}", twist_linear, ts, online_cfg_lin))
+
+    # Filter methods if --methods specified
+    if args.methods:
+        requested = set(args.methods.split(","))
+        methods = [m for m in methods if m[0] in requested]
+        if not methods:
+            print(f"ERROR: No matching methods. Available: baseline,bracket,vanilla,twist_mlp_s{ts},online_mlp_s{ts},twist_lin_s{ts},online_lin_s{ts}")
+            await llm.cleanup()
+            return
+
+    # Resume support: load existing results and skip completed methods
+    completed_methods = {}
+    if args.resume and output_path.exists():
+        with open(output_path) as f:
+            prev = json.load(f)
+        for m_name, m_results in prev.get("methods", {}).items():
+            if len(m_results) >= n_test:
+                completed_methods[m_name] = m_results
+                print(f"  Resuming: skipping {m_name} ({len(m_results)} instances already done)")
 
     # Initialize incremental output
     output = {
         "model": args.model,
         "n_train": len(train_instances),
         "n_test": n_test,
+        "n_seeds": n_seeds,
         "max_objects": args.max_objects,
         "n_particles": args.n_particles,
         "max_tokens": args.max_tokens,
         "block_size": args.block_size,
+        "twist_scale": args.twist_scale,
+        "logit_clamp": args.logit_clamp,
+        "online_config": {"epochs": args.online_epochs, "lr": args.online_lr, "l2": args.online_l2},
         "twist_config": twist_config,
+        "method_names": [m[0] for m in methods],
         "methods": {},
         "status": "running",
     }
     save_incremental(output_path, output)
 
     all_results = []
-    for method_name, tw, ts in methods:
-        print(f"\n  --- {method_name} ---")
+    for method_name, tw, m_ts, m_online in methods:
+        if method_name in completed_methods:
+            per_instance = completed_methods[method_name]
+            summary = compute_method_summary(method_name, per_instance)
+            all_results.append(summary)
+            output["methods"][method_name] = per_instance
+            save_incremental(output_path, output)
+            print(f"\n  --- {method_name}: SKIPPED (resumed) => {summary['accuracy']:.3f} [{summary['ci_lo']:.3f}, {summary['ci_hi']:.3f}] ---")
+            continue
+
+        print(f"\n  --- {method_name} ({n_seeds} seed{'s' if n_seeds > 1 else ''}) ---")
         per_instance = []
 
         for inst_idx, instance in enumerate(test_instances):
-            seed = 42 + inst_idx
+            seed_results = []
+            for s in range(n_seeds):
+                seed = 42 + inst_idx * n_seeds + s
+                result = await eval_single_instance(
+                    method_name, instance, llm, grammar, hse, evaluator,
+                    n_particles=args.n_particles, max_tokens=args.max_tokens,
+                    block_size=args.block_size, twist_head=tw, twist_scale=m_ts, seed=seed,
+                    online_config=m_online,
+                )
+                seed_results.append(result)
 
-            result = await eval_single_instance(
-                method_name, instance, llm, grammar, hse, evaluator,
-                n_particles=args.n_particles, max_tokens=args.max_tokens,
-                block_size=args.block_size, twist_head=tw, twist_scale=ts, seed=seed,
-            )
-            per_instance.append(result)
+            # Aggregate across seeds
+            mean_acc = float(np.mean([r["accuracy"] for r in seed_results]))
+            finite_logZs = [r["log_ml"] for r in seed_results if np.isfinite(r["log_ml"])]
+            aggregated = {
+                "accuracy": mean_acc,
+                "log_ml": float(np.mean(finite_logZs)) if finite_logZs else float("-inf"),
+                "ess": float(np.mean([r["ess"] for r in seed_results])),
+                "wall_time": float(np.sum([r["wall_time"] for r in seed_results])),
+            }
+            if n_seeds > 1:
+                aggregated["per_seed"] = seed_results
+            per_instance.append(aggregated)
 
-            status = "OK" if result["accuracy"] > 0 else "FAIL"
-            logz_str = f"{result['log_ml']:.2f}" if np.isfinite(result['log_ml']) else "-inf"
-            print(f"    [{inst_idx+1:3d}/{n_test}] {status}  log_Z={logz_str}  "
-                  f"ESS={result['ess']:.1f}  time={result['wall_time']:.1f}s")
+            status = "OK" if aggregated["accuracy"] > 0 else "FAIL"
+            logz_str = f"{aggregated['log_ml']:.2f}" if np.isfinite(aggregated['log_ml']) else "-inf"
+            acc_str = f"{aggregated['accuracy']:.2f}" if n_seeds > 1 else ("OK" if aggregated["accuracy"] > 0 else "FAIL")
+            if n_seeds > 1:
+                n_ok = sum(1 for r in seed_results if r["accuracy"] > 0)
+                print(f"    [{inst_idx+1:3d}/{n_test}] {n_ok}/{n_seeds} seeds OK  "
+                      f"mean_acc={aggregated['accuracy']:.2f}  log_Z={logz_str}  "
+                      f"ESS={aggregated['ess']:.1f}  time={aggregated['wall_time']:.1f}s")
+            else:
+                print(f"    [{inst_idx+1:3d}/{n_test}] {status}  log_Z={logz_str}  "
+                      f"ESS={aggregated['ess']:.1f}  time={aggregated['wall_time']:.1f}s")
 
             # Incremental save after every instance
             output["methods"][method_name] = per_instance.copy()
@@ -479,8 +641,36 @@ if __name__ == "__main__":
     parser.add_argument("--n-train-rounds", type=int, default=8)
     parser.add_argument("--max-objects", type=int, default=9)
     parser.add_argument("--model", type=str, default="meta-llama/Llama-3.2-1B-Instruct")
+    parser.add_argument("--n-seeds", type=int, default=1, help="Number of seeds per instance (default: 1)")
     parser.add_argument("--save-twist", type=str, default=None, help="Path to save twist weights (default: auto)")
     parser.add_argument("--load-twist", type=str, default=None, help="Path to load pre-trained twist weights")
+    parser.add_argument("--resume", action="store_true", help="Resume from existing results file, skipping completed methods")
+
+    # Twist inference params
+    parser.add_argument("--twist-scale", type=float, default=0.1, help="Scale α for log(ψ) in shaped potential (default: 0.1)")
+    parser.add_argument("--logit-clamp", type=float, default=3.0, help="Clamp logits to [-c, c] before sigmoid (default: 3.0, 0=off)")
+
+    # Online adaptation params
+    parser.add_argument("--online-epochs", type=int, default=3, help="Gradient steps for online adaptation (default: 3)")
+    parser.add_argument("--online-lr", type=float, default=1e-4, help="Learning rate for online adaptation (default: 1e-4)")
+    parser.add_argument("--online-l2", type=float, default=0.1, help="L2 penalty weight toward pretrained params (default: 0.1)")
+
+    # Method selection
+    parser.add_argument("--methods", type=str, default=None,
+                        help="Comma-separated list of methods to run (default: all). "
+                             "E.g., --methods baseline,vanilla,online_mlp_s0.1")
+
+    # Quick mode
+    parser.add_argument("--quick", action="store_true",
+                        help="Quick mode: 5 test instances, 1 seed, subset of methods for fast iteration")
+
     args = parser.parse_args()
+
+    # Quick mode overrides
+    if args.quick:
+        args.n_test_instances = min(args.n_test_instances, 5)
+        args.n_seeds = 1
+        if args.methods is None:
+            args.methods = f"vanilla,twist_mlp_s{args.twist_scale},online_mlp_s{args.twist_scale}"
 
     asyncio.run(main(args))

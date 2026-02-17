@@ -1,0 +1,43 @@
+{
+  "buffer_size": 1092,
+  "n_pos": 763,
+  "n_neg": 329,
+  "results": [
+    {
+      "weight_scheme": "original",
+      "class_balance": false,
+      "loss": 4.15007099837804,
+      "accuracy": 0.6987179517745972,
+      "auc": 0.5,
+      "psi_pos_mean": 1.0,
+      "psi_neg_mean": 1.0
+    },
+    {
+      "weight_scheme": "uniform",
+      "class_balance": false,
+      "loss": 4.860319612092442,
+      "accuracy": 0.6987179517745972,
+      "auc": 0.5,
+      "psi_pos_mean": 1.0,
+      "psi_neg_mean": 1.0
+    },
+    {
+      "weight_scheme": "uniform",
+      "class_balance": true,
+      "loss": 0.18217252930653255,
+      "accuracy": 0.8782051205635071,
+      "auc": 0.9558115262501643,
+      "psi_pos_mean": 0.8244724869728088,
+      "psi_neg_mean": 0.14680105447769165
+    },
+    {
+      "weight_scheme": "original",
+      "class_balance": true,
+      "loss": 4.111238584005359,
+      "accuracy": 0.6987179517745972,
+      "auc": 0.5,
+      "psi_pos_mean": 1.0,
+      "psi_neg_mean": 1.0
+    }
+  ]
+}

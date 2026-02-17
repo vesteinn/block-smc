@@ -1,0 +1,461 @@
+{
+  "B": {
+    "train_mlp": {
+      "accuracy": 1.0,
+      "tpr": 1.0,
+      "tnr": NaN,
+      "n": 40,
+      "n_pos": 40,
+      "n_neg": 0
+    },
+    "test_mlp": {
+      "accuracy": 0.13793103396892548,
+      "tpr": 0.13793103396892548,
+      "tnr": NaN,
+      "n": 145,
+      "n_pos": 145,
+      "n_neg": 0
+    },
+    "train_linear": {
+      "accuracy": 0.9750000238418579,
+      "tpr": 0.9750000238418579,
+      "tnr": NaN,
+      "n": 40,
+      "n_pos": 40,
+      "n_neg": 0
+    },
+    "test_linear": {
+      "accuracy": 0.13793103396892548,
+      "tpr": 0.13793103396892548,
+      "tnr": NaN,
+      "n": 145,
+      "n_pos": 145,
+      "n_neg": 0
+    }
+  },
+  "C": {
+    "train_mlp": {
+      "ece": 0.16059334278106688,
+      "bins": [
+        {
+          "lo": 0.0,
+          "hi": 0.1,
+          "n": 0,
+          "mean_psi": 0,
+          "actual_pos_rate": 0
+        },
+        {
+          "lo": 0.1,
+          "hi": 0.2,
+          "n": 0,
+          "mean_psi": 0,
+          "actual_pos_rate": 0
+        },
+        {
+          "lo": 0.2,
+          "hi": 0.30000000000000004,
+          "n": 0,
+          "mean_psi": 0,
+          "actual_pos_rate": 0
+        },
+        {
+          "lo": 0.30000000000000004,
+          "hi": 0.4,
+          "n": 0,
+          "mean_psi": 0,
+          "actual_pos_rate": 0
+        },
+        {
+          "lo": 0.4,
+          "hi": 0.5,
+          "n": 0,
+          "mean_psi": 0,
+          "actual_pos_rate": 0
+        },
+        {
+          "lo": 0.5,
+          "hi": 0.6000000000000001,
+          "n": 1,
+          "mean_psi": 0.5324980020523071,
+          "actual_pos_rate": 1.0
+        },
+        {
+          "lo": 0.6000000000000001,
+          "hi": 0.7000000000000001,
+          "n": 3,
+          "mean_psi": 0.6432549357414246,
+          "actual_pos_rate": 1.0
+        },
+        {
+          "lo": 0.7000000000000001,
+          "hi": 0.8,
+          "n": 9,
+          "mean_psi": 0.7711423635482788,
+          "actual_pos_rate": 1.0
+        },
+        {
+          "lo": 0.8,
+          "hi": 0.9,
+          "n": 23,
+          "mean_psi": 0.8771412968635559,
+          "actual_pos_rate": 1.0
+        },
+        {
+          "lo": 0.9,
+          "hi": 1.0,
+          "n": 4,
+          "mean_psi": 0.9998680949211121,
+          "actual_pos_rate": 1.0
+        }
+      ]
+    },
+    "test_mlp": {
+      "ece": 0.8478315328729564,
+      "bins": [
+        {
+          "lo": 0.0,
+          "hi": 0.1,
+          "n": 115,
+          "mean_psi": 4.328822615207173e-05,
+          "actual_pos_rate": 1.0
+        },
+        {
+          "lo": 0.1,
+          "hi": 0.2,
+          "n": 0,
+          "mean_psi": 0,
+          "actual_pos_rate": 0
+        },
+        {
+          "lo": 0.2,
+          "hi": 0.30000000000000004,
+          "n": 10,
+          "mean_psi": 0.20994654297828674,
+          "actual_pos_rate": 1.0
+        },
+        {
+          "lo": 0.30000000000000004,
+          "hi": 0.4,
+          "n": 0,
+          "mean_psi": 0,
+          "actual_pos_rate": 0
+        },
+        {
+          "lo": 0.4,
+          "hi": 0.5,
+          "n": 0,
+          "mean_psi": 0,
+          "actual_pos_rate": 0
+        },
+        {
+          "lo": 0.5,
+          "hi": 0.6000000000000001,
+          "n": 0,
+          "mean_psi": 0,
+          "actual_pos_rate": 0
+        },
+        {
+          "lo": 0.6000000000000001,
+          "hi": 0.7000000000000001,
+          "n": 0,
+          "mean_psi": 0,
+          "actual_pos_rate": 0
+        },
+        {
+          "lo": 0.7000000000000001,
+          "hi": 0.8,
+          "n": 0,
+          "mean_psi": 0,
+          "actual_pos_rate": 0
+        },
+        {
+          "lo": 0.8,
+          "hi": 0.9,
+          "n": 0,
+          "mean_psi": 0,
+          "actual_pos_rate": 0
+        },
+        {
+          "lo": 0.9,
+          "hi": 1.0,
+          "n": 20,
+          "mean_psi": 0.9979993104934692,
+          "actual_pos_rate": 1.0
+        }
+      ]
+    },
+    "train_linear": {
+      "ece": 0.18349872827529906,
+      "bins": [
+        {
+          "lo": 0.0,
+          "hi": 0.1,
+          "n": 0,
+          "mean_psi": 0,
+          "actual_pos_rate": 0
+        },
+        {
+          "lo": 0.1,
+          "hi": 0.2,
+          "n": 0,
+          "mean_psi": 0,
+          "actual_pos_rate": 0
+        },
+        {
+          "lo": 0.2,
+          "hi": 0.30000000000000004,
+          "n": 0,
+          "mean_psi": 0,
+          "actual_pos_rate": 0
+        },
+        {
+          "lo": 0.30000000000000004,
+          "hi": 0.4,
+          "n": 1,
+          "mean_psi": 0.329853892326355,
+          "actual_pos_rate": 1.0
+        },
+        {
+          "lo": 0.4,
+          "hi": 0.5,
+          "n": 0,
+          "mean_psi": 0,
+          "actual_pos_rate": 0
+        },
+        {
+          "lo": 0.5,
+          "hi": 0.6000000000000001,
+          "n": 3,
+          "mean_psi": 0.5627894997596741,
+          "actual_pos_rate": 1.0
+        },
+        {
+          "lo": 0.6000000000000001,
+          "hi": 0.7000000000000001,
+          "n": 0,
+          "mean_psi": 0,
+          "actual_pos_rate": 0
+        },
+        {
+          "lo": 0.7000000000000001,
+          "hi": 0.8,
+          "n": 17,
+          "mean_psi": 0.7753289341926575,
+          "actual_pos_rate": 1.0
+        },
+        {
+          "lo": 0.8,
+          "hi": 0.9,
+          "n": 7,
+          "mean_psi": 0.8677612543106079,
+          "actual_pos_rate": 1.0
+        },
+        {
+          "lo": 0.9,
+          "hi": 1.0,
+          "n": 12,
+          "mean_psi": 0.9489089846611023,
+          "actual_pos_rate": 1.0
+        }
+      ]
+    },
+    "test_linear": {
+      "ece": 0.8160914100449662,
+      "bins": [
+        {
+          "lo": 0.0,
+          "hi": 0.1,
+          "n": 105,
+          "mean_psi": 0.00217165844514966,
+          "actual_pos_rate": 1.0
+        },
+        {
+          "lo": 0.1,
+          "hi": 0.2,
+          "n": 0,
+          "mean_psi": 0,
+          "actual_pos_rate": 0
+        },
+        {
+          "lo": 0.2,
+          "hi": 0.30000000000000004,
+          "n": 10,
+          "mean_psi": 0.2805359959602356,
+          "actual_pos_rate": 1.0
+        },
+        {
+          "lo": 0.30000000000000004,
+          "hi": 0.4,
+          "n": 0,
+          "mean_psi": 0,
+          "actual_pos_rate": 0
+        },
+        {
+          "lo": 0.4,
+          "hi": 0.5,
+          "n": 10,
+          "mean_psi": 0.433366596698761,
+          "actual_pos_rate": 1.0
+        },
+        {
+          "lo": 0.5,
+          "hi": 0.6000000000000001,
+          "n": 0,
+          "mean_psi": 0,
+          "actual_pos_rate": 0
+        },
+        {
+          "lo": 0.6000000000000001,
+          "hi": 0.7000000000000001,
+          "n": 0,
+          "mean_psi": 0,
+          "actual_pos_rate": 0
+        },
+        {
+          "lo": 0.7000000000000001,
+          "hi": 0.8,
+          "n": 0,
+          "mean_psi": 0,
+          "actual_pos_rate": 0
+        },
+        {
+          "lo": 0.8,
+          "hi": 0.9,
+          "n": 0,
+          "mean_psi": 0,
+          "actual_pos_rate": 0
+        },
+        {
+          "lo": 0.9,
+          "hi": 1.0,
+          "n": 20,
+          "mean_psi": 0.9649848937988281,
+          "actual_pos_rate": 1.0
+        }
+      ]
+    }
+  },
+  "D": {
+    "train_mlp": {
+      "logit_mean": 2.4718337059020996,
+      "logit_std": 2.656785249710083,
+      "logit_min": 0.13017538189888,
+      "logit_max": 11.018728256225586,
+      "psi_mean": 0.8394066691398621,
+      "psi_std": 0.0991019755601883,
+      "psi_lt_001": 0.0,
+      "psi_gt_099": 0.1,
+      "psi_lt_010": 0.0,
+      "psi_gt_090": 0.1
+    },
+    "test_mlp": {
+      "logit_mean": -12.907742500305176,
+      "logit_std": 11.350761413574219,
+      "logit_min": -36.27820587158203,
+      "logit_max": 7.644475936889648,
+      "psi_mean": 0.15216846764087677,
+      "psi_std": 0.3424391746520996,
+      "psi_lt_001": 0.7931034482758621,
+      "psi_gt_099": 0.13793103448275862,
+      "psi_lt_010": 0.7931034482758621,
+      "psi_gt_090": 0.13793103448275862
+    },
+    "train_linear": {
+      "logit_mean": 1.8191280364990234,
+      "logit_std": 1.1819993257522583,
+      "logit_min": -0.7088459134101868,
+      "logit_max": 6.342813968658447,
+      "psi_mean": 0.816501259803772,
+      "psi_std": 0.13204124569892883,
+      "psi_lt_001": 0.0,
+      "psi_gt_099": 0.025,
+      "psi_lt_010": 0.0,
+      "psi_gt_090": 0.3
+    },
+    "test_linear": {
+      "logit_mean": -5.543378829956055,
+      "logit_std": 5.289034843444824,
+      "logit_min": -11.946179389953613,
+      "logit_max": 6.342813491821289,
+      "psi_mean": 0.1839086264371872,
+      "psi_std": 0.336398720741272,
+      "psi_lt_001": 0.6413793103448275,
+      "psi_gt_099": 0.06896551724137931,
+      "psi_lt_010": 0.7241379310344828,
+      "psi_gt_090": 0.13793103448275862
+    }
+  },
+  "E": {
+    "mean_corr": NaN,
+    "n_instances": 0,
+    "n_positive_corr": 0,
+    "per_instance": []
+  },
+  "F": [
+    {
+      "instance_idx": 0,
+      "vanilla": {
+        "n_unique_final": 3,
+        "ess": 0.0,
+        "log_ml": -Infinity
+      },
+      "twist_s0.1": {
+        "n_unique_final": 2,
+        "ess": 10.000000000000002,
+        "log_ml": -5.601085336130012
+      }
+    },
+    {
+      "instance_idx": 1,
+      "vanilla": {
+        "n_unique_final": 4,
+        "ess": 0.0,
+        "log_ml": -Infinity
+      },
+      "twist_s0.1": {
+        "n_unique_final": 4,
+        "ess": 0.0,
+        "log_ml": -Infinity
+      }
+    },
+    {
+      "instance_idx": 2,
+      "vanilla": {
+        "n_unique_final": 6,
+        "ess": 0.0,
+        "log_ml": -Infinity
+      },
+      "twist_s0.1": {
+        "n_unique_final": 4,
+        "ess": 0.0,
+        "log_ml": -Infinity
+      }
+    },
+    {
+      "instance_idx": 3,
+      "vanilla": {
+        "n_unique_final": 5,
+        "ess": 0.0,
+        "log_ml": -Infinity
+      },
+      "twist_s0.1": {
+        "n_unique_final": 6,
+        "ess": 0.0,
+        "log_ml": -Infinity
+      }
+    },
+    {
+      "instance_idx": 4,
+      "vanilla": {
+        "n_unique_final": 3,
+        "ess": 0.0,
+        "log_ml": -Infinity
+      },
+      "twist_s0.1": {
+        "n_unique_final": 1,
+        "ess": 10.000000000000002,
+        "log_ml": -4.361167023212513
+      }
+    }
+  ]
+}

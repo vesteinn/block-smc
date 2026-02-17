@@ -1,0 +1,9 @@
+{
+  "model": "meta-llama/Llama-3.2-1B-Instruct",
+  "auc": 0.8783904226798243,
+  "train_twist_acc": 0.8029978275299072,
+  "train_twist_loss": 0.17161796872814497,
+  "buffer_size": 934,
+  "n_pos": 746,
+  "n_neg": 188
+}

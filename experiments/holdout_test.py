@@ -24,6 +24,7 @@ from pathlib import Path
 from genlm.control import PromptedLLM, BoolCFG, eager_token_sampler, SMC, EOS
 from genlm.control.constant import EndOfSequence
 from genlm.control.sampler.unit import MultiTokenUnitSampler, TokenSetBoundary, flatten_units
+from genlm.control.sampler.token import DirectTokenSampler
 from genlm.eval.domains.goal_inference import (
     GoalInferenceDataset,
     GoalInferenceVALPotential,
@@ -128,8 +129,18 @@ def mcnemar_test(per_a, per_b):
 async def collect_training_data(
     train_instances, llm, grammar, hse,
     n_particles, max_tokens, block_size, n_train_rounds,
+    n_gramfree_rounds=0,
 ):
-    """Collect twist training data from train instances."""
+    """Collect twist training data from train instances.
+
+    Args:
+        n_train_rounds: Total grammar-constrained rounds per instance (split
+            between guided + explore).
+        n_gramfree_rounds: Additional grammar-free exploration rounds per
+            instance. These produce negative labels from invalid PDDL syntax,
+            giving the twist discrimination signal that grammar-constrained
+            rounds cannot provide.
+    """
     buffer = TwistTrainingBuffer()
     n_guided = n_train_rounds // 2
     n_explore = n_train_rounds - n_guided
@@ -176,9 +187,25 @@ async def collect_training_data(
             await collect_twist_training_data(seq, hse, coerced, buffer, num_blocks_est=num_blocks_est)
             buffer.advance_age()
 
+        # Grammar-free rounds: LM without grammar constraints produces some
+        # invalid PDDL, giving prefix() real negative labels
+        for r in range(n_gramfree_rounds):
+            np.random.seed(2000 + r + inst_idx * 100)
+            unconstrained_sampler = DirectTokenSampler(local_llm)
+            unit_sampler_gf = MultiTokenUnitSampler(
+                unconstrained_sampler, FixedIntervalBoundary(block_size),
+                max_subunits_per_unit=100,
+            )
+            gf_smc = SMC(unit_sampler_gf)
+            seq = await gf_smc(n_particles=n_particles, ess_threshold=0.5, max_tokens=max_tokens)
+            await collect_twist_training_data(seq, hse, coerced, buffer, num_blocks_est=num_blocks_est)
+            buffer.advance_age()
+
     n_pos = sum(1 for l in buffer.labels if l > 0.5)
     n_neg = sum(1 for l in buffer.labels if l <= 0.5)
     print(f"  Buffer: {len(buffer)} samples ({n_pos}+ / {n_neg}-)")
+    if n_gramfree_rounds > 0:
+        print(f"    ({n_guided} guided + {n_explore} explore + {n_gramfree_rounds} grammar-free rounds/instance)")
     return buffer
 
 
@@ -243,8 +270,69 @@ async def eval_single_instance(
         smc = SMC(unit_sampler, critic=coerced_nested)
         seq = await smc(n_particles=n_particles, ess_threshold=0.9, max_tokens=max_tokens)
         posterior = decoded_posterior_nested(seq)
+    elif online_config is not None and online_config.get("from_scratch"):
+        # Online from scratch: phase 1 exploration, train fresh twist, phase 2 with twist
+        scratch_cfg = online_config
+
+        if scratch_cfg.get("grammar_free"):
+            # Phase 1: grammar-free LM exploration (no grammar constraints)
+            # Without grammar, the LM occasionally produces invalid PDDL,
+            # giving prefix() real negative labels for twist training.
+            unconstrained_sampler = DirectTokenSampler(local_llm)
+            unit_sampler_p1 = MultiTokenUnitSampler(
+                unconstrained_sampler, FixedIntervalBoundary(block_size),
+                max_subunits_per_unit=100,
+            )
+            smc_explore = SMC(unit_sampler_p1)
+            seq_p1 = await smc_explore(n_particles=n_particles, ess_threshold=0.5, max_tokens=max_tokens)
+        else:
+            # Phase 1: vanilla Block SMC (grammar-constrained, no twist)
+            smc_vanilla = make_block_smc(
+                token_sampler=token_sampler,
+                boundary_predicate=FixedIntervalBoundary(block_size),
+                expensive_potential=expensive, llm=local_llm,
+            )
+            seq_p1 = await run_block_smc(smc_vanilla, n_particles=n_particles, ess_threshold=0.9, max_tokens=max_tokens)
+
+        # Collect training data from phase 1 particles
+        adapt_buffer = TwistTrainingBuffer()
+        collect_stats = await collect_twist_training_data(
+            seq_p1, hse, coerced, adapt_buffer, num_blocks_est=num_blocks_est,
+        )
+        adapt_buffer.boundary_fracs = [0.0] * len(adapt_buffer)  # bf=False
+        n_pos = collect_stats["n_positive"]
+        n_neg = collect_stats["n_examples"] - n_pos
+        gf_tag = " [grammar-free]" if scratch_cfg.get("grammar_free") else ""
+        print(f"      {method_name} P1 data: {collect_stats['n_examples']} samples ({n_pos}+ / {n_neg}-){gf_tag}")
+
+        # Train a fresh twist from scratch on this instance
+        scratch_twist = TwistHead(
+            d_model=hse.hidden_dim,
+            hidden_dim=scratch_cfg.get("hidden_dim", 256),
+            logit_clamp=scratch_cfg.get("logit_clamp", 3.0),
+        ).to(hse.device)
+        opt = torch.optim.Adam(scratch_twist.parameters(), lr=scratch_cfg.get("lr", 1e-3))
+        train_res = train_twist_step(
+            scratch_twist, adapt_buffer, opt, hse.device,
+            n_epochs=scratch_cfg.get("n_epochs", 10),
+            batch_size=64, class_balance=True, uniform_weights=True,
+        )
+        scratch_twist.eval()
+        print(f"      {method_name} twist: loss={train_res['loss']:.4f} acc={train_res['accuracy']:.3f}")
+
+        # Phase 2: Block SMC with the scratch-trained twist
+        smc = make_block_smc(
+            token_sampler=token_sampler,
+            boundary_predicate=FixedIntervalBoundary(block_size),
+            expensive_potential=expensive, llm=local_llm,
+            twist_head=scratch_twist, hidden_state_extractor=hse,
+            num_blocks=num_blocks_est, twist_scale=twist_scale,
+        )
+        seq = await run_block_smc(smc, n_particles=n_particles, ess_threshold=0.9, max_tokens=max_tokens)
+        posterior = decode_block_sequences(seq)
+
     elif online_config is not None and twist_head is not None:
-        # Two-phase online adaptation
+        # Two-phase online adaptation (pretrained → adapt → run again)
         pretrained_state = online_config["pretrained_state"]
 
         # Phase 1: run Block SMC with pretrained twist
@@ -259,9 +347,12 @@ async def eval_single_instance(
 
         # Collect training data from phase 1 particles
         adapt_buffer = TwistTrainingBuffer()
-        await collect_twist_training_data(
+        collect_stats = await collect_twist_training_data(
             seq_p1, hse, coerced, adapt_buffer, num_blocks_est=num_blocks_est,
         )
+        n_pos = collect_stats["n_positive"]
+        n_neg = collect_stats["n_examples"] - n_pos
+        print(f"      {method_name} P1 data: {collect_stats['n_examples']} samples ({n_pos}+ / {n_neg}-)")
 
         # Adapt twist to this instance (modifies twist_head in-place)
         adapt_result = adapt_twist_online(
@@ -418,6 +509,7 @@ async def main(args):
             train_instances, llm, grammar, hse,
             n_particles=args.n_particles, max_tokens=args.max_tokens,
             block_size=args.block_size, n_train_rounds=args.n_train_rounds,
+            n_gramfree_rounds=args.n_gramfree_rounds,
         )
         data_time = time.time() - t0
         print(f"Data collection: {data_time:.0f}s")
@@ -467,6 +559,8 @@ async def main(args):
             "mlp_acc": res["accuracy"], "mlp_loss": res["loss"],
             "linear_acc": res_linear["accuracy"], "linear_loss": res_linear["loss"],
             "n_train": len(train_instances),
+            "n_train_rounds": args.n_train_rounds,
+            "n_gramfree_rounds": args.n_gramfree_rounds,
             "buffer_size": len(buffer), "n_pos": res["n_pos"], "n_neg": res["n_neg"],
             "data_collection_time": data_time,
         }
@@ -506,6 +600,26 @@ async def main(args):
 
     ts = args.twist_scale
 
+    # Online from scratch config (no pretrained anchor, more epochs, higher LR)
+    scratch_cfg = {
+        "from_scratch": True,
+        "n_epochs": 10,
+        "lr": 1e-3,
+        "hidden_dim": 256,
+        "logit_clamp": args.logit_clamp,
+    }
+
+    # Grammar-free online: Phase 1 without grammar constraints so prefix()
+    # gives real negative labels (invalid PDDL), then train twist from scratch.
+    gramfree_cfg = {
+        "from_scratch": True,
+        "grammar_free": True,
+        "n_epochs": 10,
+        "lr": 1e-3,
+        "hidden_dim": 256,
+        "logit_clamp": args.logit_clamp,
+    }
+
     # Methods to evaluate: (name, twist_head, twist_scale, online_config)
     methods = [
         ("baseline", None, 0.0, None),
@@ -513,6 +627,8 @@ async def main(args):
         ("vanilla", None, 0.0, None),
         (f"twist_mlp_s{ts}", twist, ts, None),
         (f"online_mlp_s{ts}", twist, ts, online_cfg_mlp),
+        (f"scratch_s{ts}", None, ts, scratch_cfg),
+        (f"gramfree_s{ts}", None, ts, gramfree_cfg),
     ]
     if twist_linear is not None:
         methods.append((f"twist_lin_s{ts}", twist_linear, ts, None))
@@ -520,10 +636,11 @@ async def main(args):
 
     # Filter methods if --methods specified
     if args.methods:
+        all_method_names = [m[0] for m in methods]
         requested = set(args.methods.split(","))
         methods = [m for m in methods if m[0] in requested]
         if not methods:
-            print(f"ERROR: No matching methods. Available: baseline,bracket,vanilla,twist_mlp_s{ts},online_mlp_s{ts},twist_lin_s{ts},online_lin_s{ts}")
+            print(f"ERROR: No matching methods. Available: {','.join(all_method_names)}")
             await llm.cleanup()
             return
 
@@ -639,6 +756,9 @@ if __name__ == "__main__":
     parser.add_argument("--max-tokens", type=int, default=150)
     parser.add_argument("--block-size", type=int, default=10)
     parser.add_argument("--n-train-rounds", type=int, default=8)
+    parser.add_argument("--n-gramfree-rounds", type=int, default=0,
+                        help="Grammar-free exploration rounds per train instance (default: 0). "
+                             "These produce negative labels from invalid PDDL syntax.")
     parser.add_argument("--max-objects", type=int, default=9)
     parser.add_argument("--model", type=str, default="meta-llama/Llama-3.2-1B-Instruct")
     parser.add_argument("--n-seeds", type=int, default=1, help="Number of seeds per instance (default: 1)")
@@ -671,6 +791,6 @@ if __name__ == "__main__":
         args.n_test_instances = min(args.n_test_instances, 5)
         args.n_seeds = 1
         if args.methods is None:
-            args.methods = f"vanilla,twist_mlp_s{args.twist_scale},online_mlp_s{args.twist_scale}"
+            args.methods = f"vanilla,twist_mlp_s{args.twist_scale},scratch_s{args.twist_scale},gramfree_s{args.twist_scale}"
 
     asyncio.run(main(args))
